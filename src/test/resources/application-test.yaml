@@ -1,0 +1,10 @@
+# Test profile: no broker is started for tests, so the RocketMQ configuration
+# is switched off entirely (see RocketMQConfig's @ConditionalOnProperty).
+# Datasource and Redis settings are supplied by Testcontainers through
+# @ServiceConnection and are deliberately not hardcoded here.
+rocketmq:
+  enabled: false
+
+logging:
+  level:
+    com.example.demo: DEBUG

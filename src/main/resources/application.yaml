@@ -2,8 +2,35 @@ spring:
   application:
     name: demo
 
-# define mysql properties here
+  # MySQL: durable storage for rate limit rules.
+  # allowPublicKeyRetrieval=true is required because MySQL 8 authenticates
+  # taskuser with caching_sha2_password over a plaintext connection.
+  # connectionTimeZone (the Connector/J 8+ name; serverTimezone is deprecated)
+  # must match the server's --default-time-zone in docker-compose.yaml, or
+  # DATETIME values shift silently by hours. '+' is URL-encoded as %2B.
+  datasource:
+    url: jdbc:mysql://localhost:3306/taskdb?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=%2B08:00
+    username: taskuser
+    password: taskpass
+    driver-class-name: com.mysql.cj.jdbc.Driver
 
-# define redis properties here
+  # Redis: config cache and window counters.
+  # Spring Boot 3 moved these from spring.redis.* to spring.data.redis.*;
+  # the old prefix is silently ignored and falls back to localhost:6379.
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 2s
 
-# define rocketmq properties here
+  # Serialise OffsetDateTime as ISO-8601 with an offset instead of a number.
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+# RocketMQ: consumed by the native rocketmq-client, which has no
+# auto-configuration for these properties (read manually in RocketMQConfig).
+# rocketmq.enabled=false lets the application start without a broker.
+rocketmq:
+  enabled: true
+  name-server: localhost:9876

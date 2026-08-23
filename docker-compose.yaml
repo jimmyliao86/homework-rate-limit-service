@@ -10,6 +10,11 @@ services:
       MYSQL_DATABASE: taskdb
       MYSQL_USER: taskuser
       MYSQL_PASSWORD: taskpass
+    # Pin the server time zone so CURRENT_TIMESTAMP(3) matches the
+    # connectionTimeZone configured in application.yaml. It must be the numeric
+    # offset: named zones such as Asia/Taipei require the time zone tables,
+    # which the official image does not load, and the server refuses to start.
+    command: --default-time-zone=+08:00
     ports:
       - "3306:3306"
     volumes:
