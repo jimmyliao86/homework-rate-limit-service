@@ -1,0 +1,9 @@
+spring:
+  application:
+    name: demo
+
+# define mysql properties here
+
+# define redis properties here
+
+# define rocketmq properties here
