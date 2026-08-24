@@ -76,8 +76,8 @@ class RateLimitRuleControllerTest {
                 .andExpect(status().isCreated())
                 .andExpect(content().string(""));
 
-        // The wire field is 'limit'; the Java component is 'limitCount' because 'limit' is
-        // a reserved word in MySQL. This asserts the mapping actually happens.
+        // The request DTO names the field 'limit', unlike the record that mirrors the
+        // table. This asserts the body binds onto it.
         ArgumentCaptor<CreateLimitRequest> captor = ArgumentCaptor.forClass(CreateLimitRequest.class);
         verify(service).save(captor.capture());
         assertThat(captor.getValue())
@@ -110,9 +110,9 @@ class RateLimitRuleControllerTest {
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
                 .andExpect(jsonPath("$.title").value("Invalid Request"))
                 .andExpect(jsonPath("$.errors.apiKey").exists())
-                // Bean Validation reports the Java property name, so the caller sends
-                // 'limit' and is told about 'limitCount'. Documented rather than hidden.
-                .andExpect(jsonPath("$.errors.limitCount").exists())
+                // Bean Validation reports the Java property name, which is why the request
+                // DTO calls this field 'limit': the caller is told about what it sent.
+                .andExpect(jsonPath("$.errors.limit").exists())
                 .andExpect(jsonPath("$.errors.windowSeconds").exists());
 
         verifyNoInteractions(service);
@@ -141,7 +141,7 @@ class RateLimitRuleControllerTest {
                                 {"apiKey":"abc-123","windowSeconds":60}
                                 """))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.errors.limitCount").exists());
+                .andExpect(jsonPath("$.errors.limit").exists());
 
         verifyNoInteractions(service);
     }

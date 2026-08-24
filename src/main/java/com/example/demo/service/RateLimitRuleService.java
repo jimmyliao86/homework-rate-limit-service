@@ -65,13 +65,13 @@ public class RateLimitRuleService {
      *         upsert's own affected-rows count, so it costs nothing.
      */
     public boolean save(CreateLimitRequest request) {
-        int affectedRows = repository.upsert(request.apiKey(), request.limitCount(), request.windowSeconds());
+        int affectedRows = repository.upsert(request.apiKey(), request.limit(), request.windowSeconds());
         // After the write, not before: evicting first would let a concurrent read
         // repopulate the cache from the pre-update row and leave it there for ten minutes.
         cache.evict(request.apiKey());
         boolean created = affectedRows == 1;
         log.debug("{} rule for API key '{}': limit={}, windowSeconds={}",
-                created ? "Created" : "Updated", request.apiKey(), request.limitCount(), request.windowSeconds());
+                created ? "Created" : "Updated", request.apiKey(), request.limit(), request.windowSeconds());
         return created;
     }
 

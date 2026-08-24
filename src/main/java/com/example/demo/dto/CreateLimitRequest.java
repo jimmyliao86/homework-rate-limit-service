@@ -1,7 +1,5 @@
 package com.example.demo.dto;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
-
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -10,9 +8,13 @@ import jakarta.validation.constraints.Size;
 /**
  * The body of {@code POST /limits}: create a rule or overwrite an existing one.
  *
- * <p>{@code limit} on the wire, {@code limitCount} in Java. The split starts in the
- * database -- {@code limit} is a MySQL reserved word -- and stops here: the API is not
- * going to expose a column-naming workaround to its callers.
+ * <p>The quota field is called {@code limit} here, not {@code limitCount} as everywhere
+ * else in this codebase. That name exists because {@code limit} is a MySQL reserved word,
+ * which constrains the table and the record that mirrors it -- but nothing on this class
+ * ever reaches SQL, and Bean Validation reports the <em>Java</em> property path, which
+ * {@code @JsonProperty} does not rename. Called {@code limitCount}, a rejected
+ * {@code {"limit": 0}} would come back as {@code errors.limitCount}: a 400 that names a
+ * field the caller never sent, defeating the point of the map.
  *
  * <p>The two numbers are boxed rather than {@code int} so that omitting one is a
  * validation failure naming the missing field, instead of Jackson defaulting it to
@@ -28,10 +30,9 @@ public record CreateLimitRequest(
         @Size(max = 128, message = "must be at most 128 characters")
         String apiKey,
 
-        @JsonProperty("limit")
         @NotNull(message = "must not be null")
         @Min(value = 1, message = "must be at least 1")
-        Integer limitCount,
+        Integer limit,
 
         @NotNull(message = "must not be null")
         @Min(value = 1, message = "must be at least 1")
