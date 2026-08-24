@@ -366,7 +366,10 @@ When the key does not exist, `usage = 0` and the TTL is normalised to `0` by the
 ### 5.5 Execution details (two traps that break everything)
 
 **`StringRedisTemplate` is mandatory** (or pass `StringRedisSerializer` explicitly as the
-args/result serializer to `execute()`).
+args/result serializer to `execute()`). Spring Boot's `RedisAutoConfiguration` already
+declares it, so `RedisConfig` **does not redeclare it** — the auto-configured bean is
+`@ConditionalOnMissingBean`, and a copy of it would be identical to the one it replaces.
+`RedisConfig` contributes only the two script beans and documents the rule above.
 
 Why: `RedisTemplate.execute(script, keys, args)` serialises ARGV with the template's
 **value serializer**. With the common Spring Boot pairing of
@@ -603,8 +606,39 @@ Upsert semantics. Validation must reject: a blank apiKey, one longer than 128 ch
 `limit <= 0`, `windowSeconds <= 0`, and malformed JSON. Use `@NotBlank` / `@Size` / `@Min`
 with `@Valid`.
 
+**`CreateLimitRequest` names the quota field `limit`, not `limitCount`** — the one place in
+the codebase that breaks the naming split. `limitCount` exists because `limit` is a MySQL
+reserved word, which binds the table and the record mirroring it; nothing on the request
+DTO reaches SQL. The reason is not cosmetic: Bean Validation reports the **Java** property
+path and `@JsonProperty` does not rename it, so a `limitCount` component turns a rejected
+`{"limit": 0}` into `errors.limitCount` — a `400` naming a field the caller never sent,
+which is precisely what §9.1's `errors` map exists to avoid. `LimitResponse` keeps
+`limitCount` + `@JsonProperty("limit")`, because nothing validates a response.
+
+The two numeric fields are boxed `Integer` with `@NotNull`, not `int`: an omitted field
+would otherwise default to `0` and be reported as "must be at least 1" for a value that
+was never sent.
+
 On success: atomic upsert into the database (version + 1), then delete the Redis config
 cache.
+
+**`save` must not be `@Transactional` either, for the mirror-image reason.** The eviction
+has to happen after the upsert *commits*, not merely after the statement executes. Inside a
+transaction the sequence becomes:
+
+```
+  BEGIN
+    INSERT ... ON DUPLICATE KEY UPDATE   (uncommitted -- the old row is still what
+    DEL config                            other sessions see)
+                                         <-- /check here: cache miss, reads the OLD row,
+                                             caches the OLD limit for 600s
+  COMMIT
+```
+
+Nothing evicts that entry afterwards, so the rule change silently does not take effect for
+up to ten minutes. The transaction adds nothing to weigh against this: the upsert is a
+single statement and therefore already atomic (§11.2), and under autocommit its row lock is
+released before the Redis call rather than being held across it.
 
 **The created resource is not returned; neither outcome has a body.** The status code
 carries the whole message:
@@ -681,6 +715,16 @@ it is free. The `X-RateLimit-*` trio is an industry convention and equally free.
 Returns current usage, remaining quota, and window TTL. **This operation must not
 increment the counter.**
 
+`UsageResponse` is `CheckResponse` minus `allowed`: `apiKey`, `usage`, `limit`,
+`remaining`, `windowTtlSeconds`, `version`. `allowed` is the one field this endpoint cannot
+answer without spending the quota it was asked to report on.
+
+**The `X-RateLimit-*` headers appear on `/check` only.** They describe what just happened
+to a rate-limited request, and on `/usage` nothing happened. `X-RateLimit-Reset` is a
+**delta in seconds, not a Unix timestamp** — the same number the body reports as
+`windowTtlSeconds`, and the variant that needs no clock agreement between server and
+client.
+
 The `apiKey` on `/check` and `/usage` is a query parameter, so `@NotBlank` only takes
 effect if the controller class is annotated `@Validated` (it throws
 `ConstraintViolationException`, already listed in §9.1).
@@ -692,11 +736,20 @@ The brief requires clearing the related Redis entries. The ordering is deliberat
 
 ```
 1. Read the rule from the database (to obtain version); 404 if absent
-2. Redis DEL rate_limit:config:{apiKey}
-   Redis DEL rate_limit:counter:{apiKey}:v{version}
+2. Redis DEL rate_limit:config:{apiKey} rate_limit:counter:{apiKey}:v{version}
 3. MySQL DELETE
 4. Redis DEL (repeat step 2)
 ```
+
+Step 2 is **one multi-key `DEL`**, not two commands and not `RateLimitConfigCache.evict`
+plus a second call: the flow runs it twice, so that is two round trips rather than four.
+`RedisKeys` is what keeps this call site building byte-for-byte the strings the cache
+wrote.
+
+**Step 3 deleting 0 rows is not a `404`.** Only the step-1 read produces one. Zero rows
+there means a concurrent `DELETE` for the same key won the race after our read — the
+caller's intent is satisfied either way, and answering `404` would make the outcome depend
+on which request the database happened to serve first, as well as skipping step 4.
 
 Because the counter key carries a version, `version` must be read first to delete it
 precisely. **No `KEYS` or `SCAN` wildcard matching** — `KEYS` blocks the whole Redis
@@ -723,12 +776,48 @@ already-deleted key; and holding a database transaction open across a call to an
 system lengthens row locks and ties connection-pool health to Redis latency. The correct
 treatment is the ordering above plus the TTL fuse in §3.3.
 
+**And the decisive reason: a transaction would make step 4 useless.** Step 4 exists to
+clear a cache entry that a concurrent `/check` repopulated between steps 2 and 3, which
+only works if the row delete has already *committed* when it runs. Inside a transaction
+step 4 runs before the commit, so a `/check` arriving after step 4 but before the commit
+still sees the row from its own snapshot, repopulates the cache from it, and nothing clears
+it again:
+
+```
+  BEGIN
+    DEL config, counter              (step 2)
+    DELETE FROM rate_limit_rule      (step 3, uncommitted -- row still visible to others)
+    DEL config, counter              (step 4, clears nothing that matters)
+                                     <-- /check here: cache miss, reads the row that is
+                                         about to disappear, caches it for 600s
+  COMMIT
+```
+
+The result is exactly the failure the whole ordering was designed to prevent — a deleted
+rule that keeps being enforced for up to ten minutes — reintroduced by the mechanism meant
+to add safety. Autocommit per statement is what makes "delete cache again" mean "delete
+cache after the row is gone".
+
+**MySQL's isolation level is why this bites.** Under InnoDB's default REPEATABLE READ a
+concurrent reader's snapshot is fixed at its own first read, so it cannot see an
+uncommitted delete no matter how long the transaction runs. The window is the transaction's
+lifetime, not a few microseconds.
+
 ### GET `/limits`
 
 Pagination happens in the database (`LIMIT :size OFFSET :offset` with a single
 `COUNT(*)`), never by fetching the whole table and slicing in memory. `page` and `size`
 are bound with `@RequestParam` and annotated `@Min(0)` and `@Min(1) @Max(100)`, so
-requests like `size=1000000` are rejected with `400`.
+requests like `size=1000000` are rejected with `400`. **`RateLimitRuleController` must
+therefore be annotated `@Validated` as well** — the same requirement stated for `/check`
+and `/usage` below, and for the same reason: without it the constraints on `@RequestParam`
+arguments are never evaluated and the `size` cap is inert.
+
+The list is read inside a `@Transactional(readOnly = true)` service method so `COUNT(*)`
+and the page query share one snapshot; issued independently, a concurrent insert between
+them yields a `totalElements` that does not match the content the caller is holding. It is
+the only transactional method in the service layer — §11.5 tabulates why the other four are
+not, and what breaks if they are.
 
 **Ordering is `created_at DESC, api_key`** -- newest rule first.
 
@@ -784,6 +873,19 @@ All errors use Spring 6's built-in `ProblemDetail` (RFC 7807), mapped centrally 
 | `RuleNotFoundException` | 404 |
 | `RedisConnectionFailureException` / `QueryTimeoutException` | 503 |
 | anything else | 500 |
+
+The advice **extends `ResponseEntityExceptionHandler`** rather than standing alone, so
+Spring MVC's own request-level exceptions — malformed JSON
+(`HttpMessageNotReadableException`), a missing query parameter, an unparseable `page` —
+are reported as `problem+json` too; left to Boot's default error page they would be the
+one family of errors not in the common shape. `handleMethodArgumentNotValid` is overridden
+purely to add the body described below.
+
+Two extension members carry what the status code cannot: a 400 adds
+`errors` (a field/parameter → message map, so the caller learns *which* part of the request
+was rejected), and a 404 adds `apiKey`. The 500 body deliberately does **not** include the
+exception message — that text is written for the logs and routinely names a SQL statement or
+an internal host.
 
 **429 is deliberately absent from this table** — the controller returns a `CheckResponse`
 directly rather than going through an exception; see `GET /check` in §8.
@@ -854,6 +956,21 @@ processing:
 The API never waits for those consumers. This gives RocketMQ a clear architectural purpose
 rather than being present only to satisfy the brief.
 
+**Every `/check` publishes an event, not only the refusals.** An earlier revision published
+`REQUEST_BLOCKED` alone; that is analytically lossy in a way nothing downstream can repair.
+Counting blocks without counting requests gives no **denominator**, so the block *rate* —
+the number anyone actually alerts on — cannot be computed. "500 blocks today" means nothing
+when traffic doubles. The Redis counter is not a substitute: it is deliberately ephemeral
+(§9.3) and resets every window, so no historical series can be built from it. Publishing
+both outcomes is also what §15's "durable usage analytics fed by RocketMQ events" requires
+in order to be possible at all.
+
+The cost is accepted openly and bounded in §14.8: `/check` is by design the
+highest-frequency path in the system, and this puts a per-request write back onto it —
+just to a different system than the MySQL write §9.4 refuses. It remains off the *critical*
+path (the send is asynchronous and swallows its own failures, so correctness and latency
+are unaffected), but it is now on the *cost* path.
+
 ### 10.2 Client choice: keep the scaffold's native `rocketmq-client 5.3.2`
 
 **The dependency the scaffold provides is left untouched**, for concrete reasons:
@@ -886,8 +1003,29 @@ rather than being present only to satisfy the brief.
 }
 ```
 
-`eventType` values: `REQUEST_BLOCKED` (over limit), `RULE_UPDATED`, `RULE_DELETED`.
-`eventId` is a UUID, giving consumers a basis for idempotent deduplication.
+`eventType` values: `REQUEST_ALLOWED`, `REQUEST_BLOCKED` (over limit), `RULE_UPDATED`,
+`RULE_DELETED`. `eventId` is a UUID, giving consumers a basis for idempotent deduplication.
+
+**The outcome is an `eventType`, not an `allowed` boolean field.** A boolean would read
+more naturally, but the publisher sets the RocketMQ **tag** to `eventType`, and tag
+filtering happens **on the broker**. A consumer that only cares about refusals can
+`subscribe(TOPIC, "REQUEST_BLOCKED")` and never receive the rest; a rule-audit consumer can
+`subscribe(TOPIC, "RULE_UPDATED || RULE_DELETED")` and stay out of the firehose entirely. A
+boolean lives in the body, where the broker cannot see it, forcing every such consumer to
+pull the whole stream down and filter client-side.
+
+This is also why **the access events and the rule events stay on one topic** despite
+differing in volume by orders of magnitude: broker-side tag filtering already gives each
+consumer only what it asked for. Splitting them would only start to pay off when the two
+need different retention policies (days for the firehose, months for the audit trail),
+which is a production concern rather than one for this scope.
+
+**Not every field is meaningful for every event type**, and the shape stays the same
+anyway so consumers parse one thing rather than three. A rule event has no usage to
+report, and `RULE_UPDATED` has no version either -- `save` deliberately does not read the
+row back (§8), so there is no version to name without a second query that a replica could
+answer with the pre-update row. Both are `0` in that case, which `RateLimitEvent.UNKNOWN`
+names at the one place it is produced.
 
 **The timestamp is epoch millis (`long`), not an ISO-8601 string**, and this is more than
 a formatting preference:
@@ -912,10 +1050,34 @@ and `DEFAULT_CONSUMER` cannot be reused — RocketMQ rejects them outright.
 logged and nothing more; it must never affect the HTTP response. MQ must not slow down,
 let alone bring down, `/check`.
 
-**Consumer**: a `DefaultMQPushConsumer` subscribes to the same topic, writes each event as
-a structured log line, and returns `CONSUME_SUCCESS`. Its purpose is to drain the queue so
-messages do not accumulate, and to demonstrate the complete
-producer -> broker -> consumer chain.
+**Consumer**: a `DefaultMQPushConsumer` subscribes to the same topic and returns
+`CONSUME_SUCCESS`. Its purpose is to drain the queue so messages do not accumulate, and to
+demonstrate the complete producer -> broker -> consumer chain.
+
+**It logs by event importance and keeps no state.** One log line per event at a single
+level stopped being viable once every `/check` publishes, so the level is chosen per event
+type instead:
+
+| Event | Level | Why |
+| --- | --- | --- |
+| `REQUEST_BLOCKED` | `INFO` | The anomaly, and actionable on its own because it carries the key: `apiKey=abc-123 usage=100/100 windowSeconds=60`. Comparatively low volume |
+| `REQUEST_ALLOWED` | `DEBUG` | Ordinary traffic; wanted while developing or in a test environment, silent in production |
+| `RULE_UPDATED` / `RULE_DELETED` | `INFO` | Rare, and each one matters |
+
+**No aggregation, no counters, no scheduled flush.** An earlier revision had the consumer
+keep in-memory tallies and emit a periodic `blockRate` summary; that was rejected for two
+reasons. First, a block rate aggregated across all keys is close to useless — rate limiting
+is inherently per-key, so ninety-nine healthy keys plus one being hammered to a 100% block
+rate still reports a comfortable ~1% overall, hiding exactly the situation worth seeing.
+Second, computing rates is what §10.1 says the *downstream* consumers are for; building it
+here quietly turns the demonstration consumer into a half-finished metrics system.
+
+Tiered levels give both of the things the summary was reaching for, with less code than
+before: blocked events are visible by default so the chain is demonstrably closing, and
+turning on `DEBUG` yields the full per-request picture during development. Parameterised
+SLF4J logging (`log.debug("... {} ...", a, b)`) costs essentially nothing when the level is
+disabled — the level is checked before any string is built — so the production path stays
+clean.
 
 **Lifecycle**: use `@Bean(initMethod = "start", destroyMethod = "shutdown")` to hand
 management to the Spring container. The consumer has an ordering constraint, though —
@@ -1011,6 +1173,53 @@ semantic is:
 Requests that observe the new version use the new counter. This avoids needing a
 distributed lock around every rule change, and since windows are typically tens of
 seconds, the inconsistency window is both extremely short and harmless.
+
+### 11.5 Transaction boundaries
+
+`spring-boot-starter-jdbc` brings `spring-tx` and
+`DataSourceTransactionManagerAutoConfiguration`, so `@Transactional` is live rather than
+silently inert — worth confirming before reasoning about it either way. Exactly one method
+in the service layer uses it:
+
+| Method | `@Transactional` | Why |
+| --- | --- | --- |
+| `RateLimitRuleService.list` | **`readOnly = true`** | The only place two statements have to agree. See below |
+| `RateLimitRuleService.save` | **no** | Would cache the pre-update rule for 600s (§8, POST `/limits`) |
+| `RateLimitRuleService.delete` | **no** | Would make the three-phase ordering's step 4 useless (§8, DELETE) |
+| `RateLimitCheckService.check` / `usage` | **no** | Semantically empty, and would take a pooled connection on the hottest path. See below |
+
+**No operation anywhere needs multi-statement atomicity**, and that is designed rather than
+lucky: §11.2 chose a single atomic upsert over read-modify-write precisely so the shape that
+would require a transaction never appears. `delete` is a single statement too.
+
+**`list` is the one genuine use.** `COUNT(*)` and the page query are two statements, and
+under InnoDB's default REPEATABLE READ the consistent snapshot is established at the
+transaction's first read and reused by the second, so `totalElements` agrees with the
+`content` beside it. Without the transaction each statement gets its own snapshot and a
+concurrent insert between them makes the two disagree. The isolation level is load-bearing:
+under READ COMMITTED each statement would take a fresh snapshot and the annotation would buy
+nothing. Nothing in `application.yaml` overrides it.
+
+Honest accounting: this is the weakest of the five arguments. What it prevents is a
+`totalElements` that is off by one, and OFFSET pagination is racy across requests anyway
+(which is why §8 sorts on the immutable `created_at`). It stays because it is close to free
+— one connection held across two statements instead of taken twice, and `readOnly = true`
+additionally lets InnoDB skip allocating a transaction ID — not because the API would be
+wrong without it.
+
+**`check` and `usage` must not be transactional, on two independent grounds.** First it
+would be semantically empty: Redis operations do not join a JDBC transaction. A
+`StringRedisTemplate` only enlists in one when `setEnableTransactionSupport(true)` is set,
+which this design deliberately does not do — the Lua scripts are already atomic, and
+`MULTI`/`EXEC` is strictly weaker than a script since it cannot branch on a value it read.
+The only database access on this path is the single `SELECT` inside the config cache's miss
+handler, which has nothing to coordinate with.
+
+Second, and more damaging: `DataSourceTransactionManager` acquires its `Connection` when the
+transaction *begins*, not when the first statement runs. Every `/check` would therefore take
+a connection out of the Hikari pool, including the overwhelming majority that are cache hits
+and never touch MySQL at all. That caps the throughput of the system's hottest path at the
+pool size, to protect a transaction that was doing nothing.
 
 ---
 
@@ -1150,6 +1359,35 @@ on first send and this works without any change. Production deployments conventi
 disable it, however, so writing `autoCreateTopicEnable = true` explicitly in `broker.conf`
 makes the dependency visible at a glance.
 
+### 12.7 The broker needs `-XX:-UseContainerSupport` [blocking for the consumer]
+
+Found while implementing task 7, and invisible until a consumer actually pulls.
+
+`apache/rocketmq:5.1.4` ships JDK 8u372, whose cgroup v2 support throws
+`NullPointerException` inside `CgroupV2Subsystem.getInstance` on a cgroup v2 host --
+which is what Docker Desktop provides. The broker reaches that code through
+`ManagementFactory.getOperatingSystemMXBean()` in `StoreUtil`'s static initialiser, and
+`StoreUtil` is touched only by `DefaultMessageStore.estimateInMemByCommitOffset`, on the
+**pull** path. So the failure is asymmetric and thoroughly misleading:
+
+- sends succeed, the topic is auto-created, `mqadmin topicStatus` shows the messages
+  arriving -- everything looks correct from the producer side;
+- every pull fails with
+  `MQBrokerException: CODE: 1 DESC: java.lang.NoClassDefFoundError: Could not initialize
+  class org.apache.rocketmq.store.StoreUtil`, which the client logs to
+  `~/logs/rocketmqlogs/rocketmq_client.log`, not to the application log. The application
+  itself shows nothing at all: no consumption, no errors, silence.
+
+Adding `-XX:-UseContainerSupport` to the broker's `JAVA_OPT_EXT` in `docker-compose.yaml`
+skips the cgroup lookup and fixes it -- verified: all three event types then reach the
+consumer. Container awareness is only there to size the heap from the container's limits,
+and `-Xms512m -Xmx512m` is already stated explicitly, so nothing is lost.
+
+The alternative is bumping the image to a release whose JDK does not have the bug (5.3.x
+would also match `rocketmq-client 5.3.2`), which additionally means changing the
+`broker.conf` mount path that carries the version in it. The one-flag fix is smaller and
+keeps the scaffold's image.
+
 ---
 
 ## 13. Project Structure
@@ -1157,9 +1395,9 @@ makes the dependency visible at a glance.
 ```
 com.example.demo
 ├── DemoApplication.java
-├── config/       RedisConfig (StringRedisTemplate + DefaultRedisScript) · RocketMQConfig
+├── config/       RedisConfig (two DefaultRedisScript beans) · RocketMQConfig
 ├── controller/   RateLimitRuleController (/limits) · RateLimitCheckController (/check, /usage)
-├── service/      RateLimitRuleService · RateLimitCheckService · RateLimitConfigCache
+├── service/      RateLimitRuleService · RateLimitCheckService · RateLimitConfigCache · RedisKeys
 ├── repository/   RateLimitRuleRepository (JdbcClient)
 ├── domain/       RateLimitRule (record) · RateLimitConfig (cache value object)
 ├── dto/          CreateLimitRequest · LimitResponse · CheckResponse · UsageResponse · PagedResponse
@@ -1202,6 +1440,7 @@ time budget of this assignment:
 | 14.5 | RocketMQ events are asynchronous | There is no guarantee an event has been consumed by the time `/check` responds |
 | 14.6 | Fixed-window algorithm | At a window boundary the worst case admits close to twice the intended traffic; this is not a token bucket or sliding window |
 | 14.7 | Negative caching only stops repeated keys | The tombstone in §6.5 stops the same non-existent key being queried repeatedly, but not an attack using a **fresh random** apiKey every time — each of those is a first miss. A complete answer needs existence pre-filtering such as a bloom filter |
+| 14.8 | MQ volume equals `/check` volume | Publishing every outcome (§10.1) means one message per request, unsampled and unbatched. `DefaultMQProducer` bounds in-flight async sends with a semaphore (`clientAsyncSemaphoreValue`, default 65535); sustained overload starts rejecting sends, and since rejections are logged and dropped, the log becomes the next bottleneck. The same volume problem reaches the consumer's log in one specific case: `REQUEST_BLOCKED` is logged at `INFO` (§10.4) on the assumption that refusals are comparatively rare, which stops being true while a key is under sustained attack — precisely when every one of those lines is least useful. Bounding it would need the log itself to be rate limited (once per key per interval), which is deliberately not built here. Fine at assignment scale; mitigations are named in §15 |
 
 ---
 
@@ -1219,6 +1458,13 @@ If this service needed to run at significantly larger scale:
   caches asynchronously, reconcile versions
 - **Observability**: metrics, tracing, structured logs, Redis latency, MySQL query
   metrics, RocketMQ consumer lag
+- **MQ volume** (the mitigations for §14.8): **sampling** — publish 100% of
+  `REQUEST_BLOCKED` but only N% of `REQUEST_ALLOWED`, carrying the sample rate in the event
+  so downstream can scale the denominator back up; **batching** —
+  `producer.send(List<Message>)` to amortise the round trip over many events;
+  **periodic aggregation** — replace per-request events with a scheduled per-key counter
+  snapshot, which cuts volume by orders of magnitude and still yields the denominator, at
+  the cost of per-request granularity and of events becoming snapshots rather than facts
 - **Durable usage analytics**: a separate consumer and storage layer fed by RocketMQ
   events, retaining historical usage
 - **Rule listing at scale**: the `(created_at DESC, api_key)` index (§3.1) already matches
@@ -1262,6 +1508,10 @@ If this service needed to run at significantly larger scale:
 | Redis operations not wrapped in a DB transaction | A timeout does not mean it did not run, the two DELs are not atomic, and a cross-system call inside a transaction lengthens row locks — that is fake atomicity |
 | 429 returns `CheckResponse`, not `ProblemDetail` | "No" is a successful answer from `/check`; a throttled client needs `remaining` and the TTL most |
 | MQ timestamps as epoch millis | Keeps the event DTO purely primitive so any `ObjectMapper` can serialise it, removing the `JavaTimeModule` trap |
+| Every `/check` publishes, not just refusals | Blocks without requests give no denominator, so block *rate* cannot be computed; the Redis counter cannot substitute because it is ephemeral. Volume cost accepted and bounded in §14.8 |
+| Outcome carried as `eventType`, not an `allowed` boolean | The tag is set from `eventType` and RocketMQ filters tags **broker-side**; a boolean sits in the body where the broker cannot see it, forcing consumers to pull the whole stream |
+| Access and rule events share one topic | Broker-side tag filtering already isolates each consumer; separate topics would only pay off for differing retention policies |
+| Consumer logs per event type, and keeps no state | Blocked at `INFO` (visible by default, carries the key, actionable), allowed at `DEBUG` (free when disabled), rule events at `INFO`. An aggregated `blockRate` was rejected: averaged across keys it hides the one key being hammered, and computing rates belongs to the downstream consumers §10.1 describes, not to the demonstration consumer |
 | RocketMQ is asynchronous | Keeps `/check` latency low |
 | RocketMQ does not drive rate limiting | The decision must be synchronous |
 | RocketMQ does not clean up old counters | Redis TTL already solves it |

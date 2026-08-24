@@ -1,0 +1,79 @@
+# Rate Limiting Service
+
+An API-key-based rate limiting service built on Spring Boot 3 with MySQL, Redis and
+RocketMQ. Written as a backend take-home assignment; the assignment brief itself is
+deliberately not reproduced here.
+
+| Document | What is in it |
+| --- | --- |
+| [`HELP.md`](HELP.md) | How to start everything, verify it, and every configuration trap that costs an hour if missed |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | The design: architecture, data model, the algorithm, failure semantics, limitations and what production would need |
+| [`curl-samples.sh`](curl-samples.sh) | The full API walked end to end, runnable against a live instance |
+
+## In one minute
+
+```bash
+docker compose up -d          # MySQL, Redis, RocketMQ
+./mvnw spring-boot:run        # the application, on :8080
+./curl-samples.sh             # the whole contract, end to end
+```
+
+Requires JDK 21 and Docker. `./mvnw test` runs 92 tests against Testcontainers-backed
+MySQL and Redis.
+
+## API
+
+| Method | Endpoint | Purpose | Success |
+| --- | --- | --- | --- |
+| `POST` | `/limits` | Create or update a rule (`apiKey`, `limit`, `windowSeconds`) | `201` created / `204` updated, no body |
+| `GET` | `/check?apiKey=...` | Consume one request against the quota | `200` allowed / `429` over limit |
+| `GET` | `/usage?apiKey=...` | Current usage, remaining quota and window TTL, without consuming | `200` |
+| `DELETE` | `/limits/{apiKey}` | Remove a rule and its Redis state | `204` |
+| `GET` | `/limits?page=&size=` | List rules, paginated | `200` |
+
+`/check` carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`, plus
+`Retry-After` on a `429`. Errors are RFC 7807 `application/problem+json`; a `400` names the
+offending fields in an `errors` map and a `404` names the `apiKey`. `429` deliberately is
+**not** a problem document — "no, not right now" is a successful answer to the question
+`/check` asks, and the caller needs `remaining` and `windowTtlSeconds` most of all.
+
+## How it works
+
+MySQL is the durable source of truth for rules. **Redis is the only input to the rate-limit
+decision**: it holds a cached copy of the rule and the current window counter, and a single
+Lua script reads the counter, compares it with the limit and increments it in one atomic
+step — so a request can never be counted without also being decided, or decided against a
+count that has already moved. RocketMQ carries an event for every outcome, always
+asynchronously and never on the critical path: if the broker is down, the API is unaffected.
+
+Two decisions carry most of the weight:
+
+- **Versioned counter keys.** Each rule row has a `version`, and the counter key embeds it
+  (`rate_limit:counter:{apiKey}:v7`). Changing a rule increments the version, so the next
+  request writes to a *different* key and the quota resets with no counter deletion, no
+  scan, and no window in which a stale count is enforced against a new limit. Old keys expire
+  on their own TTL.
+- **Fail closed.** If Redis is unavailable, `/check` returns `503` rather than falling back
+  to MySQL or letting traffic through. MySQL does not hold current usage and could not serve
+  it at this rate anyway, and a rate limiter that opens the gates the moment its state store
+  dies removes the only defence at the most fragile moment.
+
+Both, and every other decision worth arguing about, are written up with their rejected
+alternatives in [`docs/DESIGN.md`](docs/DESIGN.md) — §4 for the versioned counters, §16 for
+the decision table.
+
+## Scope and honesty
+
+Fixed-window counting is what the assignment specifies (`INCR` + `EXPIRE`); it allows up to
+twice the limit across a window boundary, and `docs/DESIGN.md` §14 lists that along with the
+other known limitations rather than leaving them to be discovered.
+
+## AI assistance
+
+This project was written with AI assistance (Claude Code), which the assignment explicitly
+permits. The system design in `docs/DESIGN.md` was produced first and reviewed by me before
+any code existed; implementation then proceeded task by task against it, each task carrying
+its own tests, which is why the commit history reads the way it does. Every decision
+recorded in the design — the versioned counters, fail-closed on Redis, the three-phase
+delete ordering, the transaction boundaries — is one I reviewed and agreed with, and I can
+explain and defend any of it.
