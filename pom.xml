@@ -100,6 +100,21 @@
     </dependencyManagement>
 
     <build>
+        <testResources>
+            <testResource>
+                <directory>src/test/resources</directory>
+            </testResource>
+            <!-- init.sql lives at the project root because docker-compose.yaml mounts it
+                 into the MySQL container. Put the very same file on the test classpath so
+                 Testcontainers can apply it with withInitScript("init.sql"), instead of
+                 keeping a second copy of the schema that could drift. -->
+            <testResource>
+                <directory>${project.basedir}</directory>
+                <includes>
+                    <include>init.sql</include>
+                </includes>
+            </testResource>
+        </testResources>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>

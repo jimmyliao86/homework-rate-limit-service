@@ -105,7 +105,9 @@ CREATE TABLE IF NOT EXISTS rate_limit_rule (
     created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
                                          ON UPDATE CURRENT_TIMESTAMP(3),
-    PRIMARY KEY (api_key)
+    PRIMARY KEY (api_key),
+    -- Serves the only list query, GET /limits (§8).
+    KEY idx_created_at_api_key (created_at DESC, api_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
@@ -728,6 +730,32 @@ Pagination happens in the database (`LIMIT :size OFFSET :offset` with a single
 are bound with `@RequestParam` and annotated `@Min(0)` and `@Min(1) @Max(100)`, so
 requests like `size=1000000` are rejected with `400`.
 
+**Ordering is `created_at DESC, api_key`** -- newest rule first.
+
+| Sort key | Assessment |
+| --- | --- |
+| `api_key` | **Rejected.** It is the primary key, so it costs nothing, but an API key is an opaque identifier: alphabetical order gives the reader no useful sense of the list |
+| `updated_at` | **Rejected.** It moves. A concurrent `POST /limits` would pull a row to the front of the list *between* two page requests, so a caller walking the pages sees that row twice and misses another one entirely |
+| **`created_at`** | **Adopted.** Newest first matches what an operator is usually looking for -- what was just configured -- and the value never changes after insert, so no row can jump between pages while the list is being walked |
+
+`api_key` is appended as a **tie-breaker, not a second preference**: `DATETIME(3)` resolves
+only to a millisecond, and `OFFSET` pagination silently duplicates and skips rows unless
+the sort defines a total order. Two rules created in the same millisecond would otherwise
+have no defined relative order at all.
+
+The schema carries a matching index, `KEY idx_created_at_api_key (created_at DESC, api_key)`
+(§3.1). **The descending direction is load-bearing, not decoration**: MySQL can read an
+ascending index backwards to satisfy `ORDER BY created_at DESC` on its own, but this sort
+mixes directions, and reading `(created_at, api_key)` backwards would yield `api_key DESC`
+as well -- the wrong order. This requires MySQL 8.0; 5.7 parses `DESC` in an index
+definition and silently ignores it.
+
+At this service's scale the optimiser will often still prefer a full scan plus filesort, and
+it is right to: the index does not cover `limit_count`, `window_seconds`, `version` or
+`updated_at`, so using it costs one primary-key lookup per returned row, which only beats
+scanning and sorting the table once the table is genuinely large. The index is in the DDL so
+the schema matches the query pattern and the plan flips on its own when that point arrives.
+
 The response uses a custom `PagedResponse<T>` DTO (`content`, `page`, `size`,
 `totalElements`, `totalPages`), keeping the format under our own control.
 
@@ -1076,9 +1104,39 @@ so both must be supplied explicitly:
 ```java
 new MySQLContainer<>("mysql:8.0")
     .withCommand("--default-time-zone=+08:00")
-    .withUrlParam("connectionTimeZone", "+08:00")
+    .withUrlParam("connectionTimeZone", "%2B08:00")
     .withInitScript("init.sql")
 ```
+
+**`withUrlParam` needs `%2B` too, not a literal `+`** [blocking, verified in task 2].
+`withUrlParam` appends the value to the JDBC URL's query string verbatim, so a bare `+`
+is decoded as a space and the container never becomes reachable:
+
+```
+java.time.DateTimeException: Invalid ID for region-based ZoneId, invalid format:  08:00
+```
+
+The rule is the same one §12.3 states for `application.yaml` -- it is a query string on
+both sides, so it must be encoded on both sides.
+
+**`withInitScript` resolves from the classpath**, but `init.sql` lives at the project root
+because `docker-compose.yaml` mounts it from there. Rather than keeping a second copy that
+could drift, `pom.xml` puts the same file on the test classpath:
+
+```xml
+<testResources>
+    <testResource>
+        <directory>src/test/resources</directory>
+    </testResource>
+    <testResource>
+        <directory>${project.basedir}</directory>
+        <includes><include>init.sql</include></includes>
+    </testResource>
+</testResources>
+```
+
+(Declaring any `<testResource>` replaces the default, so `src/test/resources` has to be
+listed explicitly alongside it.)
 
 ### 12.5 `rocketmq.name-server` has no auto-configuration
 
@@ -1163,6 +1221,9 @@ If this service needed to run at significantly larger scale:
   metrics, RocketMQ consumer lag
 - **Durable usage analytics**: a separate consumer and storage layer fed by RocketMQ
   events, retaining historical usage
+- **Rule listing at scale**: the `(created_at DESC, api_key)` index (§3.1) already matches
+  the sort; what remains is replacing `OFFSET` with keyset pagination, so that deep pages
+  stop reading everything they skip over
 
 ---
 
