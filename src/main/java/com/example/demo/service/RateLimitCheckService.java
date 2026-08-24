@@ -24,6 +24,16 @@ import com.example.demo.dto.UsageResponse;
  * This class therefore catches nothing; the {@code DataAccessException}s Redis raises
  * travel untouched to {@code GlobalExceptionHandler}.
  *
+ * <p><strong>Neither method is {@code @Transactional}</strong>, on two independent
+ * grounds. It would be semantically empty -- Redis does not join a JDBC transaction unless
+ * the template opts in with {@code setEnableTransactionSupport}, which this design does not,
+ * because the Lua scripts are already atomic and {@code MULTI}/{@code EXEC} is strictly
+ * weaker than a script that can branch on what it read. And it would be expensive:
+ * {@code DataSourceTransactionManager} takes its connection when the transaction begins,
+ * not when a statement runs, so every request would hold one from the pool -- including the
+ * overwhelming majority that hit the cache and never reach MySQL at all. That would cap the
+ * throughput of the hottest path in the system at the pool size, in exchange for nothing.
+ *
  * <p>The counter key carries {@code version}, so the config read and the counter operation
  * cannot disagree: whichever rule version a request observed, it counts against that
  * version's own counter. A rule changed mid-flight simply means the next request opens a

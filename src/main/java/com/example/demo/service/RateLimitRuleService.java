@@ -29,6 +29,16 @@ import com.example.demo.repository.RateLimitRuleRepository;
  * become a {@code 503}, which is the honest answer: the rule was written but the derived
  * state may not match yet, and the caller should retry rather than be told everything
  * went well.
+ *
+ * <p><strong>{@code save} and {@code delete} are deliberately not
+ * {@code @Transactional}</strong>, and the absence is load-bearing rather than an
+ * oversight. Both are a single SQL statement, so a transaction adds no atomicity -- but it
+ * would move the statement's commit to <em>after</em> the Redis work, and every Redis
+ * delete here only means anything once the row change is visible to other sessions. Wrapped
+ * in a transaction, a concurrent {@code /check} slipping in before the commit reads the row
+ * as it was, caches it for ten minutes, and nothing evicts it again: a rule change that
+ * silently does not take effect, or a deleted rule that keeps being enforced. Autocommit
+ * per statement is what makes "clear the cache afterwards" mean afterwards.
  */
 @Service
 public class RateLimitRuleService {
@@ -129,7 +139,13 @@ public class RateLimitRuleService {
      *
      * <p>Read-only and transactional so the count and the page are the same snapshot.
      * Issued as two independent statements, a rule inserted between them would produce a
-     * {@code totalElements} that does not match the content the caller is looking at.
+     * {@code totalElements} that does not match the content the caller is looking at. This
+     * is the only method in the class that wants a transaction, because it is the only one
+     * where two statements have to agree.
+     *
+     * <p>InnoDB's default REPEATABLE READ is what makes it work: the snapshot is fixed at
+     * the transaction's first read and reused by the second. Under READ COMMITTED each
+     * statement would take a fresh one and the annotation would buy nothing.
      *
      * @param page zero-based page index
      * @param size page size; capped by the controller, since an uncapped one lets a single

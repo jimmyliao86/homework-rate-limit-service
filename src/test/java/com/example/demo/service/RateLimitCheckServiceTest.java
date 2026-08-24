@@ -138,4 +138,16 @@ class RateLimitCheckServiceTest {
         assertThatThrownBy(() -> service.check(API_KEY))
                 .isInstanceOf(RedisConnectionFailureException.class);
     }
+
+    @Test
+    @DisplayName("A null reply from Redis fails loudly instead of a silent NullPointerException")
+    void nullReplyFromRedisFailsWithAClearMessage() {
+        given(configCache.get(API_KEY)).willReturn(CONFIG);
+        given(redis.execute(same(checkAndIncrScript), anyList(), any(Object[].class)))
+                .willReturn(null);
+
+        assertThatThrownBy(() -> service.check(API_KEY))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(API_KEY);
+    }
 }
