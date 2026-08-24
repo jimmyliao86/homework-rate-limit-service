@@ -2,6 +2,7 @@ package com.example.demo.service;
 
 import java.util.List;
 
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
@@ -10,6 +11,8 @@ import org.springframework.stereotype.Service;
 import com.example.demo.domain.RateLimitConfig;
 import com.example.demo.dto.CheckResponse;
 import com.example.demo.dto.UsageResponse;
+import com.example.demo.messaging.RateLimitEvent;
+import com.example.demo.messaging.RateLimitEventPublisher;
 
 /**
  * The rate limit decision itself: resolve the rule, then run one Lua script against the
@@ -38,12 +41,25 @@ import com.example.demo.dto.UsageResponse;
  * cannot disagree: whichever rule version a request observed, it counts against that
  * version's own counter. A rule changed mid-flight simply means the next request opens a
  * fresh counter, and no request is ever measured against a limit it was not shown.
+ *
+ * <p><strong>Every {@code /check} publishes an event</strong> -- {@code REQUEST_ALLOWED} or
+ * {@code REQUEST_BLOCKED} -- and that is the only thing RocketMQ does on this path: it is
+ * told what was decided, it never participates in deciding. Publishing the refusals alone
+ * would be cheaper and analytically useless: blocks without requests give no denominator,
+ * so the block <em>rate</em>, which is the number anyone alerts on, could not be computed
+ * downstream, and the Redis counter cannot supply it either because it is deliberately
+ * ephemeral and resets every window. The price is one message per request on the busiest
+ * path in the system; it is paid off the critical path, since the publisher is asynchronous
+ * and swallows its own failures, so the broker cannot slow down or break {@code /check}.
+ * When {@code rocketmq.enabled} is false the publisher is not there at all, which is why it
+ * arrives through an {@link ObjectProvider} rather than as a hard dependency.
  */
 @Service
 public class RateLimitCheckService {
 
     private final RateLimitConfigCache configCache;
     private final StringRedisTemplate redis;
+    private final ObjectProvider<RateLimitEventPublisher> eventPublisher;
 
     /**
      * Both scripts have the same bean type, so the qualifiers are load-bearing rather than
@@ -60,11 +76,13 @@ public class RateLimitCheckService {
     public RateLimitCheckService(RateLimitConfigCache configCache,
                                  StringRedisTemplate redis,
                                  @Qualifier("checkAndIncrScript") RedisScript<List> checkAndIncrScript,
-                                 @Qualifier("peekScript") RedisScript<List> peekScript) {
+                                 @Qualifier("peekScript") RedisScript<List> peekScript,
+                                 ObjectProvider<RateLimitEventPublisher> eventPublisher) {
         this.configCache = configCache;
         this.redis = redis;
         this.checkAndIncrScript = checkAndIncrScript;
         this.peekScript = peekScript;
+        this.eventPublisher = eventPublisher;
     }
 
     /**
@@ -81,6 +99,15 @@ public class RateLimitCheckService {
         boolean allowed = result.get(0) == 1L;
         long usage = result.get(1);
         long ttl = result.get(2);
+
+        // Both outcomes, not just the refusal: a block count with no request count cannot be
+        // turned into a block rate, and that is the number anyone downstream alerts on.
+        publish(allowed
+                ? RateLimitEvent.requestAllowed(apiKey, config.version(), usage,
+                        config.limitCount(), config.windowSeconds())
+                : RateLimitEvent.requestBlocked(apiKey, config.version(), usage,
+                        config.limitCount(), config.windowSeconds()));
+
         return new CheckResponse(apiKey, allowed, usage, config.limitCount(),
                 config.limitCount() - usage, ttl, config.version());
     }
@@ -101,6 +128,17 @@ public class RateLimitCheckService {
         long ttl = result.get(1);
         return new UsageResponse(apiKey, usage, config.limitCount(),
                 config.limitCount() - usage, ttl, config.version());
+    }
+
+    /**
+     * Publishes an event if a publisher exists, and does nothing at all if one does not.
+     *
+     * <p>{@code ifAvailable} is the entire handling of {@code rocketmq.enabled=false}: with
+     * MQ switched off the bean is absent, and a rate limiter whose decisions depend on
+     * whether an audit topic is reachable would be a worse rate limiter.
+     */
+    private void publish(RateLimitEvent event) {
+        eventPublisher.ifAvailable(publisher -> publisher.publish(event));
     }
 
     /**

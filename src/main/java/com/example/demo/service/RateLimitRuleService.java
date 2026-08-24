@@ -4,6 +4,7 @@ import java.util.List;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -13,6 +14,8 @@ import com.example.demo.dto.CreateLimitRequest;
 import com.example.demo.dto.LimitResponse;
 import com.example.demo.dto.PagedResponse;
 import com.example.demo.exception.RuleNotFoundException;
+import com.example.demo.messaging.RateLimitEvent;
+import com.example.demo.messaging.RateLimitEventPublisher;
 import com.example.demo.repository.RateLimitRuleRepository;
 
 /**
@@ -39,6 +42,14 @@ import com.example.demo.repository.RateLimitRuleRepository;
  * as it was, caches it for ten minutes, and nothing evicts it again: a rule change that
  * silently does not take effect, or a deleted rule that keeps being enforced. Autocommit
  * per statement is what makes "clear the cache afterwards" mean afterwards.
+ *
+ * <p>Both writes announce themselves on {@code RATE_LIMIT_EVENTS} once the work is done.
+ * These are the only source of {@code RULE_UPDATED} and {@code RULE_DELETED} -- an
+ * administrative change is exactly the kind of thing a dashboard or an audit trail needs to
+ * hear about, and there is nowhere else in the system it could be observed. The event goes
+ * out <em>after</em> the row and the Redis keys are dealt with, so nothing is announced that
+ * has not happened; like every other publish, it travels through an {@link ObjectProvider}
+ * and cannot fail the request.
  */
 @Service
 public class RateLimitRuleService {
@@ -48,13 +59,16 @@ public class RateLimitRuleService {
     private final RateLimitRuleRepository repository;
     private final RateLimitConfigCache cache;
     private final StringRedisTemplate redis;
+    private final ObjectProvider<RateLimitEventPublisher> eventPublisher;
 
     public RateLimitRuleService(RateLimitRuleRepository repository,
                                 RateLimitConfigCache cache,
-                                StringRedisTemplate redis) {
+                                StringRedisTemplate redis,
+                                ObjectProvider<RateLimitEventPublisher> eventPublisher) {
         this.repository = repository;
         this.cache = cache;
         this.redis = redis;
+        this.eventPublisher = eventPublisher;
     }
 
     /**
@@ -82,6 +96,10 @@ public class RateLimitRuleService {
         boolean created = affectedRows == 1;
         log.debug("{} rule for API key '{}': limit={}, windowSeconds={}",
                 created ? "Created" : "Updated", request.apiKey(), request.limit(), request.windowSeconds());
+        // The event carries no version, for the same reason nothing is read back above: the
+        // only way to name one would be a second query, which a replica could answer with
+        // the row as it was before this write.
+        publish(RateLimitEvent.ruleUpdated(request.apiKey(), request.limit(), request.windowSeconds()));
         return created;
     }
 
@@ -132,6 +150,16 @@ public class RateLimitRuleService {
         } else {
             log.debug("Deleted rule for API key '{}' (version {})", apiKey, rule.version());
         }
+
+        // Published either way. The caller asked for the rule to be gone and it is, so a
+        // consumer that skipped the concurrent-delete case would be missing an event for a
+        // rule that really did disappear during this request.
+        publish(RateLimitEvent.ruleDeleted(apiKey, rule.version(), rule.limitCount(), rule.windowSeconds()));
+    }
+
+    /** Publishes an event if a publisher exists; with {@code rocketmq.enabled=false} it does not. */
+    private void publish(RateLimitEvent event) {
+        eventPublisher.ifAvailable(publisher -> publisher.publish(event));
     }
 
     /**

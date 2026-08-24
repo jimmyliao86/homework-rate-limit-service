@@ -14,11 +14,13 @@ import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
 import org.mockito.InOrder;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -28,6 +30,8 @@ import com.example.demo.dto.CreateLimitRequest;
 import com.example.demo.dto.LimitResponse;
 import com.example.demo.dto.PagedResponse;
 import com.example.demo.exception.RuleNotFoundException;
+import com.example.demo.messaging.RateLimitEvent;
+import com.example.demo.messaging.RateLimitEventPublisher;
 import com.example.demo.repository.RateLimitRuleRepository;
 
 /**
@@ -61,8 +65,18 @@ class RateLimitRuleServiceTest {
     @Mock
     private StringRedisTemplate redis;
 
-    @InjectMocks
+    @Mock
+    private RateLimitEventPublisher publisher;
+
+    @Captor
+    private ArgumentCaptor<RateLimitEvent> event;
+
     private RateLimitRuleService service;
+
+    @BeforeEach
+    void setUp() {
+        service = new RateLimitRuleService(repository, cache, redis, TestObjectProvider.of(publisher));
+    }
 
     @Test
     @DisplayName("DELETE clears Redis, deletes the row, then clears Redis again")
@@ -109,7 +123,7 @@ class RateLimitRuleServiceTest {
                 .satisfies(ex -> assertThat(ex.apiKey()).isEqualTo(API_KEY));
 
         verify(repository, never()).deleteByApiKey(anyString());
-        verifyNoInteractions(redis);
+        verifyNoInteractions(redis, publisher);
     }
 
     @Test
@@ -151,6 +165,55 @@ class RateLimitRuleServiceTest {
         InOrder inOrder = inOrder(repository, cache);
         inOrder.verify(repository).upsert(API_KEY, 100, 60);
         inOrder.verify(cache).evict(API_KEY);
+    }
+
+    @Test
+    @DisplayName("POST publishes RULE_UPDATED after the write")
+    void savePublishesRuleUpdated() {
+        given(repository.upsert(API_KEY, 100, 60)).willReturn(1);
+
+        service.save(new CreateLimitRequest(API_KEY, 100, 60));
+
+        InOrder inOrder = inOrder(repository, publisher);
+        inOrder.verify(repository).upsert(API_KEY, 100, 60);
+        inOrder.verify(publisher).publish(event.capture());
+
+        assertThat(event.getValue().eventType()).isEqualTo(RateLimitEvent.RULE_UPDATED);
+        assertThat(event.getValue().apiKey()).isEqualTo(API_KEY);
+        assertThat(event.getValue().limitCount()).isEqualTo(100);
+        assertThat(event.getValue().windowSeconds()).isEqualTo(60);
+        // No version: save deliberately does not read the row back, so there is none to name.
+        assertThat(event.getValue().version()).isEqualTo(RateLimitEvent.UNKNOWN);
+    }
+
+    @Test
+    @DisplayName("DELETE publishes RULE_DELETED, with the version the row carried")
+    void deletePublishesRuleDeleted() {
+        given(repository.findByApiKey(API_KEY)).willReturn(Optional.of(RULE));
+        given(repository.deleteByApiKey(API_KEY)).willReturn(1);
+
+        service.delete(API_KEY);
+
+        InOrder inOrder = inOrder(repository, publisher);
+        // Announced only once the row is actually gone.
+        inOrder.verify(repository).deleteByApiKey(API_KEY);
+        inOrder.verify(publisher).publish(event.capture());
+
+        assertThat(event.getValue().eventType()).isEqualTo(RateLimitEvent.RULE_DELETED);
+        assertThat(event.getValue().apiKey()).isEqualTo(API_KEY);
+        assertThat(event.getValue().version()).isEqualTo(VERSION);
+    }
+
+    @Test
+    @DisplayName("With MQ switched off the writes still succeed and publish nothing")
+    void writesSucceedWithoutAPublisher() {
+        RateLimitRuleService withoutMq =
+                new RateLimitRuleService(repository, cache, redis, TestObjectProvider.empty());
+        given(repository.upsert(API_KEY, 100, 60)).willReturn(1);
+
+        assertThat(withoutMq.save(new CreateLimitRequest(API_KEY, 100, 60))).isTrue();
+
+        verifyNoInteractions(publisher);
     }
 
     @Test

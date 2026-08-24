@@ -59,7 +59,15 @@ services:
       - "10909:10909"
     environment:
       NAMESRV_ADDR: rocketmq-namesrv:9876
-      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+      # -XX:-UseContainerSupport is not a tuning choice. This image ships JDK
+      # 8u372, whose cgroup v2 support throws NullPointerException inside
+      # ManagementFactory.getOperatingSystemMXBean() on a cgroup v2 host such as
+      # Docker Desktop. The broker only calls it while serving a pull request, so
+      # sends succeed and every consumer fails with "Could not initialize class
+      # org.apache.rocketmq.store.StoreUtil". Turning off container awareness
+      # skips the cgroup lookup; the explicit -Xmx above is what the JVM would
+      # have needed it for.
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m -XX:-UseContainerSupport"
     volumes:
       - ./broker.conf:/home/rocketmq/rocketmq-5.1.4/conf/broker.conf
     command: sh mqbroker -c /home/rocketmq/rocketmq-5.1.4/conf/broker.conf

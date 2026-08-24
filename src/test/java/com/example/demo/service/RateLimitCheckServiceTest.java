@@ -8,14 +8,22 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
+import static org.mockito.BDDMockito.willThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 
 import java.util.List;
 
+import org.apache.rocketmq.client.exception.MQClientException;
+import org.apache.rocketmq.client.producer.DefaultMQProducer;
+import org.apache.rocketmq.client.producer.SendCallback;
+import org.apache.rocketmq.common.message.Message;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.RedisConnectionFailureException;
@@ -27,6 +35,9 @@ import com.example.demo.domain.RateLimitConfig;
 import com.example.demo.dto.CheckResponse;
 import com.example.demo.dto.UsageResponse;
 import com.example.demo.exception.RuleNotFoundException;
+import com.example.demo.messaging.RateLimitEvent;
+import com.example.demo.messaging.RateLimitEventPublisher;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
  * What the service hands to Redis and what it makes of the reply.
@@ -59,11 +70,18 @@ class RateLimitCheckServiceTest {
     @Mock
     private StringRedisTemplate redis;
 
+    @Mock
+    private RateLimitEventPublisher publisher;
+
+    @Captor
+    private ArgumentCaptor<RateLimitEvent> event;
+
     private RateLimitCheckService service;
 
     @BeforeEach
     void setUp() {
-        service = new RateLimitCheckService(configCache, redis, checkAndIncrScript, peekScript);
+        service = new RateLimitCheckService(configCache, redis, checkAndIncrScript, peekScript,
+                TestObjectProvider.of(publisher));
     }
 
     @Test
@@ -114,6 +132,97 @@ class RateLimitCheckServiceTest {
         then(redis).should(never()).execute(same(checkAndIncrScript), anyList(), any(Object[].class));
 
         assertThat(response).isEqualTo(new UsageResponse(API_KEY, 73, 100, 27, 42, 7));
+    }
+
+    @Test
+    @DisplayName("A blocked request publishes REQUEST_BLOCKED describing the window that refused it")
+    void blockedRequestPublishesAnEvent() {
+        given(configCache.get(API_KEY)).willReturn(CONFIG);
+        given(redis.execute(same(checkAndIncrScript), anyList(), any(Object[].class)))
+                .willReturn(List.of(0L, 100L, 17L));
+
+        service.check(API_KEY);
+
+        then(publisher).should().publish(event.capture());
+        assertThat(event.getValue().eventType()).isEqualTo(RateLimitEvent.REQUEST_BLOCKED);
+        assertThat(event.getValue().apiKey()).isEqualTo(API_KEY);
+        assertThat(event.getValue().version()).isEqualTo(7);
+        assertThat(event.getValue().usage()).isEqualTo(100);
+        assertThat(event.getValue().limitCount()).isEqualTo(100);
+        assertThat(event.getValue().windowSeconds()).isEqualTo(60);
+    }
+
+    @Test
+    @DisplayName("An allowed request publishes REQUEST_ALLOWED without changing the response")
+    void allowedRequestPublishesTheServedOutcome() {
+        given(configCache.get(API_KEY)).willReturn(CONFIG);
+        given(redis.execute(same(checkAndIncrScript), anyList(), any(Object[].class)))
+                .willReturn(List.of(1L, 73L, 42L));
+
+        CheckResponse response = service.check(API_KEY);
+
+        then(publisher).should().publish(event.capture());
+        assertThat(event.getValue().eventType()).isEqualTo(RateLimitEvent.REQUEST_ALLOWED);
+        assertThat(event.getValue().apiKey()).isEqualTo(API_KEY);
+        assertThat(event.getValue().version()).isEqualTo(7);
+        assertThat(event.getValue().usage()).isEqualTo(73);
+        assertThat(event.getValue().limitCount()).isEqualTo(100);
+        assertThat(event.getValue().windowSeconds()).isEqualTo(60);
+
+        // Publishing is an observation of the decision, never part of making it: this is the
+        // same body the service returned before the allowed path published anything.
+        assertThat(response).isEqualTo(new CheckResponse(API_KEY, true, 73, 100, 27, 42, 7));
+    }
+
+    @Test
+    @DisplayName("A broker failure on the allowed path leaves the response untouched")
+    void brokerFailureOnTheAllowedPathDoesNotAffectTheResponse() throws Exception {
+        // A real publisher over a producer that refuses to send, rather than a mock that is
+        // told not to throw. The claim being tested spans both classes: /check survives a
+        // broken broker only because the publisher swallows the failure, and the allowed
+        // path is now where nearly all of that traffic goes.
+        DefaultMQProducer producer = mock(DefaultMQProducer.class);
+        willThrow(new MQClientException("broker unreachable", null))
+                .given(producer).send(any(Message.class), any(SendCallback.class));
+        RateLimitCheckService withRealPublisher = new RateLimitCheckService(configCache, redis,
+                checkAndIncrScript, peekScript,
+                TestObjectProvider.of(new RateLimitEventPublisher(producer, new ObjectMapper(), "RATE_LIMIT_EVENTS")));
+
+        given(configCache.get(API_KEY)).willReturn(CONFIG);
+        given(redis.execute(same(checkAndIncrScript), anyList(), any(Object[].class)))
+                .willReturn(List.of(1L, 73L, 42L));
+
+        assertThat(withRealPublisher.check(API_KEY))
+                .isEqualTo(new CheckResponse(API_KEY, true, 73, 100, 27, 42, 7));
+    }
+
+    @Test
+    @DisplayName("/usage publishes nothing either -- it observes the window, it does not refuse anything")
+    void usagePublishesNothing() {
+        given(configCache.get(API_KEY)).willReturn(CONFIG);
+        given(redis.execute(same(peekScript), anyList(), any(Object[].class)))
+                .willReturn(List.of(100L, 17L));
+
+        service.usage(API_KEY);
+
+        then(publisher).shouldHaveNoInteractions();
+    }
+
+    @Test
+    @DisplayName("With MQ switched off a blocked request is still answered normally")
+    void blockedRequestWorksWithoutAPublisher() {
+        RateLimitCheckService withoutMq = new RateLimitCheckService(configCache, redis,
+                checkAndIncrScript, peekScript, TestObjectProvider.empty());
+        given(configCache.get(API_KEY)).willReturn(CONFIG);
+        given(redis.execute(same(checkAndIncrScript), anyList(), any(Object[].class)))
+                .willReturn(List.of(0L, 100L, 17L));
+
+        // The absent publisher is what rocketmq.enabled=false leaves behind; reaching for it
+        // regardless would turn every 429 into a 500 in exactly that configuration.
+        CheckResponse response = withoutMq.check(API_KEY);
+
+        assertThat(response.allowed()).isFalse();
+        then(publisher).shouldHaveNoInteractions();
     }
 
     @Test
