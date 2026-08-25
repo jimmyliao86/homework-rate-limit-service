@@ -35,9 +35,9 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import com.example.demo.config.RedisConfig;
-import com.example.demo.domain.RateLimitConfig;
-import com.example.demo.domain.RateLimitRule;
 import com.example.demo.exception.RuleNotFoundException;
+import com.example.demo.model.RateLimitConfig;
+import com.example.demo.model.RateLimitRule;
 import com.example.demo.repository.RateLimitRuleRepository;
 
 /**

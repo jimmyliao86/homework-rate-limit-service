@@ -8,11 +8,11 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
-import com.example.demo.domain.RateLimitConfig;
 import com.example.demo.dto.CheckResponse;
 import com.example.demo.dto.UsageResponse;
-import com.example.demo.messaging.RateLimitEvent;
-import com.example.demo.messaging.RateLimitEventPublisher;
+import com.example.demo.model.RateLimitConfig;
+import com.example.demo.mq.RateLimitEvent;
+import com.example.demo.mq.RateLimitEventPublisher;
 
 /**
  * The rate limit decision itself: resolve the rule, then run one Lua script against the

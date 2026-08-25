@@ -8,13 +8,13 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import com.example.demo.domain.RateLimitRule;
 import com.example.demo.dto.CreateLimitRequest;
 import com.example.demo.dto.LimitResponse;
 import com.example.demo.dto.PagedResponse;
 import com.example.demo.exception.RuleNotFoundException;
-import com.example.demo.messaging.RateLimitEvent;
-import com.example.demo.messaging.RateLimitEventPublisher;
+import com.example.demo.model.RateLimitRule;
+import com.example.demo.mq.RateLimitEvent;
+import com.example.demo.mq.RateLimitEventPublisher;
 import com.example.demo.repository.RateLimitRuleRepository;
 
 /**

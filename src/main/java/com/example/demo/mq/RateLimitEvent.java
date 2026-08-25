@@ -1,4 +1,4 @@
-package com.example.demo.messaging;
+package com.example.demo.mq;
 
 import java.util.UUID;
 

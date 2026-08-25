@@ -1586,13 +1586,20 @@ com.example.demo
 ├── controller/   RateLimitRuleController (/limits) · RateLimitCheckController (/check, /usage)
 ├── service/      RateLimitRuleService · RateLimitCheckService · RateLimitConfigCache · RedisKeys
 ├── repository/   RateLimitRuleRepository (JdbcClient)
-├── domain/       RateLimitRule (record) · RateLimitConfig (cache value object)
+├── model/        RateLimitRule (record) · RateLimitConfig (cache value object)
 ├── dto/          CreateLimitRequest · LimitResponse · CheckResponse · UsageResponse · PagedResponse
 │                 └ LimitResponse: apiKey · limit · windowSeconds · version · createdAt · updatedAt
 │                   (OffsetDateTime) — used by GET /limits only; POST /limits returns no body
-├── messaging/    RateLimitEventPublisher · RateLimitEventConsumer · RateLimitEvent
+├── mq/           RateLimitEventPublisher · RateLimitEventConsumer · RateLimitEvent
 └── exception/    RuleNotFoundException · GlobalExceptionHandler
 ```
+
+**The package layout is the scaffold's.** It ships `config`, `controller`, `model`, `mq`,
+`repository` and `service` as empty packages, and all six are used here under those names —
+`model` rather than `domain`, `mq` rather than `messaging`, even though the latter of each
+pair would be the more conventional Spring choice. Matching the structure the scaffold
+defines is worth more than the naming preference. `dto` and `exception` are the only two
+additions, and only because the scaffold offers nowhere for them to live.
 
 **Dependencies to add** (`pom.xml`; all versions managed by
 `spring-boot-starter-parent` 3.5.3, each verified): `spring-boot-starter-web`,

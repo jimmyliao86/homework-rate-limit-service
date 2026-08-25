@@ -21,9 +21,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
-import com.example.demo.domain.RateLimitConfig;
-import com.example.demo.domain.RateLimitRule;
 import com.example.demo.exception.RuleNotFoundException;
+import com.example.demo.model.RateLimitConfig;
+import com.example.demo.model.RateLimitRule;
 import com.example.demo.repository.RateLimitRuleRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;

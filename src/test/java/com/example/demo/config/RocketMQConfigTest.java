@@ -9,8 +9,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.jackson.JacksonAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
-import com.example.demo.messaging.RateLimitEventConsumer;
-import com.example.demo.messaging.RateLimitEventPublisher;
+import com.example.demo.mq.RateLimitEventConsumer;
+import com.example.demo.mq.RateLimitEventPublisher;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**

@@ -2,7 +2,7 @@ package com.example.demo.dto;
 
 import java.time.OffsetDateTime;
 
-import com.example.demo.domain.RateLimitRule;
+import com.example.demo.model.RateLimitRule;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 /**

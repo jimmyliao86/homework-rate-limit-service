@@ -3,7 +3,7 @@ package com.example.demo.service;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.beans.factory.ObjectProvider;
 
-import com.example.demo.messaging.RateLimitEventPublisher;
+import com.example.demo.mq.RateLimitEventPublisher;
 
 /**
  * A present-or-absent {@link ObjectProvider}, standing in for the container's own.

@@ -30,7 +30,7 @@ import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
-import com.example.demo.domain.RateLimitRule;
+import com.example.demo.model.RateLimitRule;
 
 /**
  * Repository tests against a real MySQL container.

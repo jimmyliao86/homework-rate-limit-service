@@ -6,7 +6,7 @@ import java.util.Optional;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 
-import com.example.demo.domain.RateLimitRule;
+import com.example.demo.model.RateLimitRule;
 
 /**
  * Data access for {@code rate_limit_rule}, built on {@link JdbcClient}.

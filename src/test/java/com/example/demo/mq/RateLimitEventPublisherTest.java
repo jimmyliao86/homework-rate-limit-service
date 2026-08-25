@@ -1,4 +1,4 @@
-package com.example.demo.messaging;
+package com.example.demo.mq;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;

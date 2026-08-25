@@ -9,8 +9,8 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import com.example.demo.messaging.RateLimitEventConsumer;
-import com.example.demo.messaging.RateLimitEventPublisher;
+import com.example.demo.mq.RateLimitEventConsumer;
+import com.example.demo.mq.RateLimitEventPublisher;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**

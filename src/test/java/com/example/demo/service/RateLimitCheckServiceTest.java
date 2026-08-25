@@ -31,12 +31,12 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 
 import com.example.demo.config.RedisConfig;
-import com.example.demo.domain.RateLimitConfig;
 import com.example.demo.dto.CheckResponse;
 import com.example.demo.dto.UsageResponse;
 import com.example.demo.exception.RuleNotFoundException;
-import com.example.demo.messaging.RateLimitEvent;
-import com.example.demo.messaging.RateLimitEventPublisher;
+import com.example.demo.model.RateLimitConfig;
+import com.example.demo.mq.RateLimitEvent;
+import com.example.demo.mq.RateLimitEventPublisher;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
