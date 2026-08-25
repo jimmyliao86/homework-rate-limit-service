@@ -46,7 +46,7 @@ step — so a request can never be counted without also being decided, or decide
 count that has already moved. RocketMQ carries an event for every outcome, always
 asynchronously and never on the critical path: if the broker is down, the API is unaffected.
 
-Two decisions carry most of the weight:
+Three decisions carry most of the weight:
 
 - **The counter key names the rule it belongs to.** It embeds both the rule's `version` and
   its `created_at` (`rate_limit:counter:{apiKey}:c1787670000000:v7`). Changing a rule bumps
@@ -65,9 +65,9 @@ Two decisions carry most of the weight:
   it at this rate anyway, and a rate limiter that opens the gates the moment its state store
   dies removes the only defence at the most fragile moment.
 
-Both, and every other decision worth arguing about, are written up with their rejected
-alternatives in [`docs/DESIGN.md`](docs/DESIGN.md) — §4 for the versioned counters, §16 for
-the decision table.
+All three, and every other decision worth arguing about, are written up with their rejected
+alternatives in [`docs/DESIGN.md`](docs/DESIGN.md) — §4 for the counter keys, §6.6 for the
+write-back fencing, §9.2 for failing closed, and §16 for the decision table.
 
 ## Scope and honesty
 
@@ -81,6 +81,8 @@ This project was written with AI assistance (Claude Code), which the assignment 
 permits. The system design in `docs/DESIGN.md` was produced first and reviewed by me before
 any code existed; implementation then proceeded task by task against it, each task carrying
 its own tests, which is why the commit history reads the way it does. Every decision
-recorded in the design — the versioned counters, fail-closed on Redis, the three-phase
-delete ordering, the transaction boundaries — is one I reviewed and agreed with, and I can
-explain and defend any of it.
+recorded in the design — the counter keys that name their rule's incarnation, the fenced
+cache write-backs, fail-closed on Redis, the three-phase delete ordering, the transaction
+boundaries — is one I reviewed and agreed with before it was implemented. Where the design
+rejects an alternative, the reasoning is recorded alongside it, and I am happy to walk
+through any of it.
