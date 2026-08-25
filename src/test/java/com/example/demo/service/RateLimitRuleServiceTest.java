@@ -23,7 +23,6 @@ import org.mockito.Captor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.data.redis.core.StringRedisTemplate;
 
 import com.example.demo.domain.RateLimitRule;
 import com.example.demo.dto.CreateLimitRequest;
@@ -48,12 +47,15 @@ class RateLimitRuleServiceTest {
 
     private static final String API_KEY = "abc-123";
     private static final long VERSION = 7;
-    private static final List<String> REDIS_KEYS =
-            List.of(RedisKeys.config(API_KEY), RedisKeys.counter(API_KEY, VERSION));
+    private static final OffsetDateTime CREATED_AT = OffsetDateTime.parse("2026-08-23T23:00:00+08:00");
+    private static final long CREATED_AT_MS = CREATED_AT.toInstant().toEpochMilli();
+
+    /** The counter key the delete flow has to name exactly, wildcards being off the table. */
+    private static final String COUNTER_KEY = RedisKeys.counter(API_KEY, CREATED_AT_MS, VERSION);
 
     private static final RateLimitRule RULE = new RateLimitRule(
             API_KEY, 100, 60, VERSION,
-            OffsetDateTime.parse("2026-08-23T23:00:00+08:00"),
+            CREATED_AT,
             OffsetDateTime.parse("2026-08-24T09:30:00+08:00"));
 
     @Mock
@@ -61,9 +63,6 @@ class RateLimitRuleServiceTest {
 
     @Mock
     private RateLimitConfigCache cache;
-
-    @Mock
-    private StringRedisTemplate redis;
 
     @Mock
     private RateLimitEventPublisher publisher;
@@ -75,7 +74,7 @@ class RateLimitRuleServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new RateLimitRuleService(repository, cache, redis, TestObjectProvider.of(publisher));
+        service = new RateLimitRuleService(repository, cache, TestObjectProvider.of(publisher));
     }
 
     @Test
@@ -86,19 +85,19 @@ class RateLimitRuleServiceTest {
 
         service.delete(API_KEY);
 
-        InOrder inOrder = inOrder(repository, redis);
+        InOrder inOrder = inOrder(repository, cache);
         // The version has to be known before the counter key can be named at all.
         inOrder.verify(repository).findByApiKey(API_KEY);
         // Derived state first: if the row delete then fails, the next /check rebuilds the
         // cache from MySQL. The reverse order would leave a deleted rule being enforced.
-        inOrder.verify(redis).delete(REDIS_KEYS);
+        inOrder.verify(cache).invalidate(API_KEY, COUNTER_KEY);
         inOrder.verify(repository).deleteByApiKey(API_KEY);
         // Again, because a concurrent /check can have repopulated the cache from the row
         // that was about to disappear.
-        inOrder.verify(redis).delete(REDIS_KEYS);
+        inOrder.verify(cache).invalidate(API_KEY, COUNTER_KEY);
         inOrder.verifyNoMoreInteractions();
 
-        verify(redis, times(2)).delete(REDIS_KEYS);
+        verify(cache, times(2)).invalidate(API_KEY, COUNTER_KEY);
     }
 
     @Test
@@ -110,7 +109,8 @@ class RateLimitRuleServiceTest {
         service.delete(API_KEY);
 
         // Both keys in one DEL, and the counter carries the version that was just read.
-        verify(redis, times(2)).delete(List.of("rate_limit:config:abc-123", "rate_limit:counter:abc-123:v7"));
+        verify(cache, times(2)).invalidate(API_KEY,
+                "rate_limit:counter:abc-123:c" + CREATED_AT_MS + ":v7");
     }
 
     @Test
@@ -123,7 +123,7 @@ class RateLimitRuleServiceTest {
                 .satisfies(ex -> assertThat(ex.apiKey()).isEqualTo(API_KEY));
 
         verify(repository, never()).deleteByApiKey(anyString());
-        verifyNoInteractions(redis, publisher);
+        verifyNoInteractions(cache, publisher);
     }
 
     @Test
@@ -134,7 +134,7 @@ class RateLimitRuleServiceTest {
 
         service.delete(API_KEY);
 
-        verify(redis, times(2)).delete(REDIS_KEYS);
+        verify(cache, times(2)).invalidate(API_KEY, COUNTER_KEY);
     }
 
     @Test
@@ -154,17 +154,23 @@ class RateLimitRuleServiceTest {
     }
 
     @Test
-    @DisplayName("POST evicts the cached rule after the write, not before")
-    void saveEvictsTheCacheAfterWriting() {
+    @DisplayName("POST invalidates before and after the write, mirroring DELETE")
+    void saveInvalidatesAroundTheWrite() {
         given(repository.upsert(API_KEY, 100, 60)).willReturn(2);
 
         service.save(new CreateLimitRequest(API_KEY, 100, 60));
 
-        // Evicting first would let a concurrent read put the pre-update row back and keep
-        // it there for the whole positive TTL.
+        // The call after the upsert is the load-bearing one: it replaces the guard token, and
+        // a reader still holding the old token has then provably selected before the commit.
+        // The call before covers a different failure -- an upsert that commits and then throws
+        // would skip the second call entirely, leaving the pre-update rule cached for ten
+        // minutes with nothing left to clear it.
         InOrder inOrder = inOrder(repository, cache);
+        inOrder.verify(cache).invalidate(API_KEY);
         inOrder.verify(repository).upsert(API_KEY, 100, 60);
-        inOrder.verify(cache).evict(API_KEY);
+        inOrder.verify(cache).invalidate(API_KEY);
+
+        verify(cache, times(2)).invalidate(API_KEY);
     }
 
     @Test
@@ -208,7 +214,7 @@ class RateLimitRuleServiceTest {
     @DisplayName("With MQ switched off the writes still succeed and publish nothing")
     void writesSucceedWithoutAPublisher() {
         RateLimitRuleService withoutMq =
-                new RateLimitRuleService(repository, cache, redis, TestObjectProvider.empty());
+                new RateLimitRuleService(repository, cache, TestObjectProvider.empty());
         given(repository.upsert(API_KEY, 100, 60)).willReturn(1);
 
         assertThat(withoutMq.save(new CreateLimitRequest(API_KEY, 100, 60))).isTrue();

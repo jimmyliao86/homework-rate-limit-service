@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.UUID;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -42,7 +43,10 @@ import com.example.demo.service.RedisKeys;
 @SuppressWarnings("rawtypes")
 class RateLimitScriptsTest {
 
-    private static final String KEY = RedisKeys.counter("abc-123", 7);
+    private static final long CREATED_AT_MS = 1787670000000L;
+    private static final String KEY = RedisKeys.counter("abc-123", CREATED_AT_MS, 7);
+    private static final String CONFIG_KEY = RedisKeys.config("abc-123");
+    private static final String EPOCH_KEY = RedisKeys.epoch("abc-123");
 
     @Container
     @ServiceConnection(name = "redis")
@@ -61,9 +65,17 @@ class RateLimitScriptsTest {
     @Qualifier("peekScript")
     private RedisScript<List> peekScript;
 
+    @Autowired
+    @Qualifier("cachePutScript")
+    private RedisScript<Long> cachePutScript;
+
+    @Autowired
+    @Qualifier("invalidateScript")
+    private RedisScript<Long> invalidateScript;
+
     @BeforeEach
     void clearCounter() {
-        redis.delete(KEY);
+        redis.delete(List.of(KEY, CONFIG_KEY, EPOCH_KEY));
     }
 
     @Test
@@ -162,6 +174,87 @@ class RateLimitScriptsTest {
                 assertThat(element).isInstanceOf(Long.class));
         assertThat(execute(peekScript)).allSatisfy(element ->
                 assertThat(element).isInstanceOf(Long.class));
+    }
+
+    @Test
+    @DisplayName("cache_put writes when the guard token is unchanged and drops when it moved")
+    void cachePutHonoursTheGuardToken() {
+        invalidate();
+        String token = redis.opsForValue().get(EPOCH_KEY);
+
+        assertThat(cachePut("{\"limit\":100}", token))
+                .as("nothing was written to the rule while we held this token")
+                .isEqualTo(1L);
+        assertThat(redis.opsForValue().get(CONFIG_KEY)).isEqualTo("{\"limit\":100}");
+
+        // A write lands: the token we are holding is now the previous one.
+        redis.delete(CONFIG_KEY);
+        invalidate();
+
+        assertThat(cachePut("{\"limit\":100}", token))
+                .as("the rule changed while we were reading it, so what we hold may be stale")
+                .isEqualTo(0L);
+        assertThat(redis.hasKey(CONFIG_KEY))
+                .as("caching it would pin a superseded rule for the whole TTL")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("cache_put treats a never-written rule as matching the empty token, not as a mismatch")
+    void cachePutAcceptsTheAbsentToken() {
+        // Redis answers a missing GET with boolean false in Lua, which is neither nil nor ''.
+        // Compared unnormalised it would never equal the empty string the reader sends, and
+        // the failure would be silent: no error, no 500, just a cache that never populates
+        // while every request goes to MySQL.
+        assertThat(redis.hasKey(EPOCH_KEY)).isFalse();
+
+        assertThat(cachePut("{\"limit\":100}", ""))
+                .as("no token on either side is a match, not a mismatch")
+                .isEqualTo(1L);
+        assertThat(redis.opsForValue().get(CONFIG_KEY)).isEqualTo("{\"limit\":100}");
+    }
+
+    @Test
+    @DisplayName("cache_put drops a write-back whose token vanished, rather than treating it as absent")
+    void cachePutRejectsAVanishedToken() {
+        assertThat(cachePut("{\"limit\":100}", "a-token-that-is-no-longer-there"))
+                .isEqualTo(0L);
+        assertThat(redis.hasKey(CONFIG_KEY)).isFalse();
+    }
+
+    @Test
+    @DisplayName("invalidate drops every key it is given and leaves a fresh token behind")
+    void invalidateClearsAndReTokens() {
+        redis.opsForValue().set(CONFIG_KEY, "{\"limit\":100}");
+        redis.opsForValue().set(KEY, "42");
+
+        assertThat(invalidate()).isEqualTo(2L);
+
+        assertThat(redis.hasKey(CONFIG_KEY)).isFalse();
+        assertThat(redis.hasKey(KEY)).as("the versioned counter goes in the same round trip").isFalse();
+
+        String token = redis.opsForValue().get(EPOCH_KEY);
+        assertThat(token)
+                .as("the epoch key is the one key this script writes rather than deletes -- an "
+                        + "absent token would match the empty sentinel a stale reader is holding "
+                        + "and hand it an accepted write-back")
+                .isNotNull();
+        assertThat(redis.getExpire(EPOCH_KEY)).isPositive().isLessThanOrEqualTo(600);
+
+        assertThat(invalidate()).isEqualTo(2L);
+        assertThat(redis.opsForValue().get(EPOCH_KEY))
+                .as("every write gets its own token, or a reader could match one write against another")
+                .isNotEqualTo(token);
+    }
+
+    private Long cachePut(String value, String expectedToken) {
+        return redis.execute(cachePutScript, List.of(CONFIG_KEY, EPOCH_KEY),
+                value, "600", expectedToken);
+    }
+
+    private Long invalidate() {
+        return redis.execute(invalidateScript, List.of(CONFIG_KEY, EPOCH_KEY, KEY),
+                UUID.randomUUID().toString(), "600");
     }
 
     private Result checkAndIncr(int limit, int windowSeconds) {

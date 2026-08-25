@@ -69,9 +69,9 @@ afterwards — printing the status code or the body for each. Expected highlight
 7.  GET    /limits?page=0&size=10     paginated content + totalElements/totalPages
 8.  GET    /limits?size=1000000       400   (size is capped at 100)
 9.  DELETE /limits/abc-123            204
-10. redis-cli KEYS 'rate_limit:*'     empty -- rule, config cache and counter all gone
+10. redis-cli KEYS 'rate_limit:*'     rule, config cache and counter gone; one epoch key left
 11. GET    /check                     404   problem+json naming the apiKey
-12. redis-cli KEYS 'rate_limit:*'     one negative-cache tombstone, TTL 30 (see below)
+12. redis-cli KEYS 'rate_limit:*'     epoch key + a negative-cache tombstone, TTL 30 (see below)
 ```
 
 The individual commands, if you would rather run them by hand:
@@ -101,8 +101,22 @@ curl 'localhost:8080/check?apiKey=abc-123'    # 404 (rule deleted)
 docker exec redis redis-cli KEYS 'rate_limit:*'
 ```
 
-Immediately after the DELETE this returns nothing: the rule row, the config cache entry and
-the versioned counter key are all gone.
+Immediately after the DELETE the rule row is gone, along with the config cache entry and the
+counter of the version the rule was on. Two things can legitimately still be listed, and
+neither is a leak:
+
+- **`rate_limit:epoch:{apiKey}`** — the write-back guard (`docs/DESIGN.md` §6.6). It is the
+  one key an invalidation *writes* rather than deletes: an absent token would match the empty
+  sentinel an in-flight reader may be holding, and hand that reader an accepted write-back. It
+  expires on its own after 600s.
+- **A counter from an earlier version of the same rule**, if the rule was updated and used
+  between updates. `DELETE` removes the counter the rule was on, not the ones it left behind
+  on the way there; those expire on their own TTL (§4.4). They are unreachable rather than
+  merely harmless — the counter key carries the rule's `created_at`, so a rule created again
+  under the same API key cannot address them.
+
+The sample script's own sequence never creates the second kind, so it will normally show just
+the epoch key; run `POST`, `/check`, `POST`, `/check`, `DELETE` by hand and one will appear.
 
 **A `GET /check` for a deleted or unknown key puts one key back, and that is correct.** The
 miss reads through to MySQL, finds nothing, and caches that absence as a tombstone —
@@ -113,6 +127,7 @@ deletes that same key, so creating the rule clears its own tombstone.
 ```bash
 docker exec redis redis-cli TTL 'rate_limit:config:abc-123'   # <= 30 for a tombstone,
                                                               # <= 600 for a cached rule
+docker exec redis redis-cli TTL 'rate_limit:epoch:abc-123'    # <= 600 for the guard token
 ```
 
 ### RocketMQ
@@ -152,7 +167,7 @@ consumption is progressing.
 ./mvnw test
 ```
 
-92 tests. Testcontainers starts MySQL and Redis on its own — Docker must be running, and
+100 tests. Testcontainers starts MySQL and Redis on its own — Docker must be running, and
 the first run pulls the images. RocketMQ is not needed: `src/test/resources/application-test.yaml`
 sets `rocketmq.enabled=false`, and the publisher is injected through an `ObjectProvider`
 that is simply absent in that case.

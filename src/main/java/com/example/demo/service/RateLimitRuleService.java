@@ -5,7 +5,6 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -58,16 +57,13 @@ public class RateLimitRuleService {
 
     private final RateLimitRuleRepository repository;
     private final RateLimitConfigCache cache;
-    private final StringRedisTemplate redis;
     private final ObjectProvider<RateLimitEventPublisher> eventPublisher;
 
     public RateLimitRuleService(RateLimitRuleRepository repository,
                                 RateLimitConfigCache cache,
-                                StringRedisTemplate redis,
                                 ObjectProvider<RateLimitEventPublisher> eventPublisher) {
         this.repository = repository;
         this.cache = cache;
-        this.redis = redis;
         this.eventPublisher = eventPublisher;
     }
 
@@ -89,10 +85,23 @@ public class RateLimitRuleService {
      *         upsert's own affected-rows count, so it costs nothing.
      */
     public boolean save(CreateLimitRequest request) {
+        // Before the write as well as after, mirroring delete()'s ordering. This first call
+        // is not what protects against a stale write-back -- the guard token does that, and
+        // the call after the upsert is the one whose ordering the guard depends on. It covers
+        // a different failure: if the upsert commits but the call then throws (a connection
+        // dropped while reading the OK packet, a pool eviction, the process dying), the
+        // second invalidate never runs, and without this one the pre-update rule would sit in
+        // the cache for ten minutes with nothing left to clear it.
+        cache.invalidate(request.apiKey());
+
         int affectedRows = repository.upsert(request.apiKey(), request.limit(), request.windowSeconds());
-        // After the write, not before: evicting first would let a concurrent read
-        // repopulate the cache from the pre-update row and leave it there for ten minutes.
-        cache.evict(request.apiKey());
+
+        // After the write, and after it has committed: the new guard token is what tells a
+        // reader still holding the old one that what it selected is superseded, which is only
+        // true once the row change is visible to other sessions. Autocommit is what makes
+        // "after" mean after.
+        cache.invalidate(request.apiKey());
+
         boolean created = affectedRows == 1;
         log.debug("{} rule for API key '{}': limit={}, windowSeconds={}",
                 created ? "Created" : "Updated", request.apiKey(), request.limit(), request.windowSeconds());
@@ -137,9 +146,10 @@ public class RateLimitRuleService {
         RateLimitRule rule = repository.findByApiKey(apiKey)
                 .orElseThrow(() -> new RuleNotFoundException(apiKey));
 
-        clearRedisState(apiKey, rule.version());
+        long createdAtEpochMs = rule.createdAt().toInstant().toEpochMilli();
+        clearRedisState(apiKey, createdAtEpochMs, rule.version());
         int deletedRows = repository.deleteByApiKey(apiKey);
-        clearRedisState(apiKey, rule.version());
+        clearRedisState(apiKey, createdAtEpochMs, rule.version());
 
         if (deletedRows == 0) {
             // Another DELETE for the same key won the race between the read above and this
@@ -189,18 +199,20 @@ public class RateLimitRuleService {
     }
 
     /**
-     * Deletes both Redis keys belonging to one rule.
+     * Clears both Redis keys belonging to one rule and re-stamps its guard token.
      *
-     * <p>Two exact keys, never a wildcard: {@code KEYS} blocks the whole instance while it
-     * scans, and {@code SCAN} needs several round trips to find what the version already
-     * tells us.
+     * <p>Exact keys, never a wildcard: {@code KEYS} blocks the whole instance while it scans,
+     * and {@code SCAN} needs several round trips to find what the incarnation and version
+     * already tell us.
      *
-     * <p>Both go in one {@code DEL} rather than through {@code cache.evict} plus a second
-     * call. The delete flow runs this twice, so the difference is two round trips against
-     * four; {@link RedisKeys} is exactly what keeps this call site building the same
+     * <p>It all goes through {@code cache.invalidate} in a single round trip rather than a
+     * bare {@code DEL} here plus a separate re-token. The delete flow runs this twice, so that
+     * is two round trips against four -- and, more importantly, a writer that cleared keys
+     * without replacing the token would leave the write-back guard inert for this path with
+     * nothing to say so. {@link RedisKeys} is what keeps this call site building the same
      * strings the cache wrote.
      */
-    private void clearRedisState(String apiKey, long version) {
-        redis.delete(List.of(RedisKeys.config(apiKey), RedisKeys.counter(apiKey, version)));
+    private void clearRedisState(String apiKey, long createdAtEpochMs, long version) {
+        cache.invalidate(apiKey, RedisKeys.counter(apiKey, createdAtEpochMs, version));
     }
 }

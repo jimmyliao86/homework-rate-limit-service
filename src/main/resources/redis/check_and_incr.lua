@@ -1,6 +1,6 @@
 -- Fixed-window check-and-increment, used by GET /check.
 --
--- KEYS[1] = rate_limit:counter:{apiKey}:v{version}
+-- KEYS[1] = rate_limit:counter:{apiKey}:c{createdAtEpochMs}:v{version}
 -- ARGV[1] = limit, ARGV[2] = windowSeconds
 -- returns { allowed(1/0), usage, ttl }
 --

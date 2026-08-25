@@ -1,6 +1,6 @@
 -- Read-only counter snapshot, used by GET /usage.
 --
--- KEYS[1] = rate_limit:counter:{apiKey}:v{version}
+-- KEYS[1] = rate_limit:counter:{apiKey}:c{createdAtEpochMs}:v{version}
 -- returns { usage, ttl }
 --
 -- GET and TTL are issued as one script so the pair is a consistent snapshot: read

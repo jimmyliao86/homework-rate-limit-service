@@ -37,10 +37,12 @@ import com.example.demo.messaging.RateLimitEventPublisher;
  * overwhelming majority that hit the cache and never reach MySQL at all. That would cap the
  * throughput of the hottest path in the system at the pool size, in exchange for nothing.
  *
- * <p>The counter key carries {@code version}, so the config read and the counter operation
- * cannot disagree: whichever rule version a request observed, it counts against that
- * version's own counter. A rule changed mid-flight simply means the next request opens a
- * fresh counter, and no request is ever measured against a limit it was not shown.
+ * <p>The counter key carries the rule's incarnation and {@code version}, so the config read
+ * and the counter operation cannot disagree: whichever rule a request observed, it counts
+ * against that exact rule's own counter. A rule changed mid-flight simply means the next
+ * request opens a fresh counter, and no request is ever measured against a limit it was not
+ * shown. The incarnation matters for the same reason one step further out -- a rule deleted
+ * and created again is a different rule, and must not inherit what its predecessor counted.
  *
  * <p><strong>Every {@code /check} publishes an event</strong> -- {@code REQUEST_ALLOWED} or
  * {@code REQUEST_BLOCKED} -- and that is the only thing RocketMQ does on this path: it is
@@ -160,7 +162,9 @@ public class RateLimitCheckService {
      */
     @SuppressWarnings("rawtypes")
     private List<Long> execute(RedisScript<List> script, String apiKey, RateLimitConfig config, String... args) {
-        List<?> reply = redis.execute(script, List.of(RedisKeys.counter(apiKey, config.version())), (Object[]) args);
+        List<?> reply = redis.execute(script,
+                List.of(RedisKeys.counter(apiKey, config.createdAtEpochMs(), config.version())),
+                (Object[]) args);
         if (reply == null) {
             throw new IllegalStateException("Redis returned no reply for the counter of API key '" + apiKey + "'");
         }

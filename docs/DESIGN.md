@@ -31,8 +31,10 @@ is a hard delete; there is no soft-delete flag.
                                │ read through on cache miss
                                │
   Client ──HTTP──►  Spring Boot ──────────►  Redis
-                    │          │              ├─ rate_limit:config:{apiKey}       config cache, TTL 600s
-                    │          │              └─ rate_limit:counter:{apiKey}:v{n} window counter, TTL = window
+                    │          │              ├─ rate_limit:config:{apiKey}   config cache, TTL 600s
+                    │          │              ├─ rate_limit:epoch:{apiKey}    write-back guard, TTL 600s
+                    │          │              └─ rate_limit:counter:{apiKey}:c{created}:v{n}
+                    │          │                                             window counter, TTL = window
                     │          │
                     │          └──async────►  RocketMQ  topic: RATE_LIMIT_EVENTS
                     │                              └──► Consumer (audit log)
@@ -199,12 +201,19 @@ management is still available through `@Transactional`
 
 ### 3.3 Redis
 
-Redis holds two logically distinct kinds of data:
+Redis holds three logically distinct kinds of data:
 
 | Key | Type | Value | TTL |
 | --- | --- | --- | --- |
-| `rate_limit:config:{apiKey}` | String (JSON) | `{"version":7,"limit":100,"windowSeconds":60}` | 600s |
-| `rate_limit:counter:{apiKey}:v{version}` | String (int) | `73` | `windowSeconds` |
+| `rate_limit:config:{apiKey}` | String (JSON) | `{"createdAtEpochMs":1787670000000,"version":7,"limit":100,"windowSeconds":60}` | 600s |
+| `rate_limit:epoch:{apiKey}` | String (UUID) | `3f2a9c14-8b7e-4d51-9a02-6c1e5f80d3ab` | 600s |
+| `rate_limit:counter:{apiKey}:c{createdAtEpochMs}:v{version}` | String (int) | `73` | `windowSeconds` |
+
+The counter key carries **two** discriminators, and §4 explains why neither replaces the
+other: `version` retires a counter when a rule is *updated*, `createdAtEpochMs` retires one
+when a rule is *deleted and created again*. The epoch key is a guard token: it changes on
+every write to a rule, which is what lets a cache read that missed detect that the rule moved
+underneath it before writing what it found (§6.6).
 
 **Why the config cache needs a TTL**: it is a fuse. If `DELETE /limits/{apiKey}` succeeds
 against MySQL but fails against Redis, then without a TTL that config would stay in Redis
@@ -238,38 +247,91 @@ Before                                     After
 config:abc-123                             config:abc-123
   { version: 7, limit: 100, window: 60 }     { version: 8, limit: 50, window: 60 }
 
-counter:abc-123:v7 = 73                    counter:abc-123:v8 = (does not exist)
+counter:abc-123:c{created}:v7 = 73         counter:abc-123:c{created}:v8 = (does not exist)
                                            -> next /check
-                                           counter:abc-123:v8 = 1
+                                           counter:abc-123:c{created}:v8 = 1
 ```
 
-The new configuration naturally starts from a new counter, and no code path ever reads
-the old `v7` again.
+The new configuration naturally starts from a new counter, and while the rule lives, no code
+path ever reads the old `v7` again.
 
-### 4.3 Old counters need no cleanup
+### 4.3 The version is not enough on its own
 
-Old counters disappear on their own TTL; **no cleanup mechanism is required**. This beats
-adding one because:
+"While the rule lives" is doing real work in that sentence, and getting it wrong is a
+genuine defect rather than a nicety.
+
+`version` is only incremented by `ON DUPLICATE KEY UPDATE`. A `DELETE` is a hard delete
+(§1), so the next `POST /limits` for that key is a **plain insert** and the version goes
+back to `1` — while `DELETE` removed only the counter of the version the rule was on at the
+time. Every earlier version's counter is still in Redis, waiting out its own TTL:
+
+```
+POST      -> v1,  3x /check   counter:...:v1 = 3      (limit 3)
+POST      -> v2,  1x /check   counter:...:v2 = 1
+DELETE                        removes config + counter :v2  --  :v1 survives
+POST      -> v1  (plain insert: the version resets)
+GET /check                    reads counter:...:v1 = 3  ->  429, first request ever served
+```
+
+Deleting `v1` as well would not fix it either: the recreated rule climbs to `v2`, `v3`… and
+meets its predecessor's counters there. Sweeping `v1..vN` would work, but it is precisely the
+cleanup mechanism §4.4 argues against, and it fails open the moment the Redis half of a
+`DELETE` does — leaving the hole exactly as it was.
+
+**The key name is what fixes it.** The counter key carries the rule's `created_at` as epoch
+millis alongside the version. `created_at` is not listed in the upsert, so it survives every
+update, while a re-insert generates a fresh one — which is exactly the "same rule or a
+different one?" distinction the version cannot express. Call each create-to-delete lifetime of
+an API key one **incarnation** of the rule: no incarnation can name another's counters, and no
+cleanup is required to guarantee it.
+
+The residual is recorded in §14.9 rather than engineered against: `DATETIME(3)` resolves to
+a millisecond, so a collision would need a delete and a recreate inside the same millisecond
+*and* the previous incarnation to have left counters at two or more versions, `DELETE`
+having already removed the one it was on.
+
+### 4.4 Old counters still need no cleanup
+
+With the naming settled, old counters disappear on their own TTL and **no cleanup mechanism
+is required**. This beats adding one because:
 
 - Redis already provides TTL expiry, for free
-- After a rule change the old counter has no business value; leaving it is harmless
+- Once a rule changes or disappears, its old counters are unreachable by construction, not
+  merely ignored — the key name guarantees it
 - Explicit deletion introduces extra concurrency questions (who deletes it? what if it
   half-fails?)
 - Using RocketMQ for it would be wildly disproportionate (see §10.5)
 
-> **The config version decides which counter is live; the Redis TTL decides when obsolete
-> counters vanish.**
+> **The rule's incarnation and version together decide which counter is live; the Redis
+> TTL decides when obsolete counters vanish.**
 
-### 4.4 Rule update flow
+### 4.5 Rule update flow
 
 When `POST /limits` updates an existing key:
 
 1. Validate the new configuration
-2. Write to MySQL with a **single atomic upsert**, `version = version + 1` (see §11.2)
-3. **Delete** the Redis config cache (delete rather than update — deletion has no write
-   race, and the next read repopulates from the source)
-4. Leave the old counter alone
-5. The new version automatically uses a new counter key
+2. **Invalidate** the Redis config cache
+3. Write to MySQL with a **single atomic upsert**, `version = version + 1` (see §11.2)
+4. **Invalidate** again
+5. Leave the old counter alone
+6. The new version automatically uses a new counter key
+
+Invalidating rather than overwriting: a delete has nothing to race with, and the next read
+repopulates from the source.
+
+**Why twice, and why the two steps are not the same argument.** Step 4 is the one that
+matters in the ordinary case: a cached copy must not outlive the row it was copied from, and
+only a delete that runs *after* the upsert has committed can guarantee that. Step 2 covers
+something narrower — if the upsert commits and the call then throws (a connection dropped
+while reading the OK packet, a pool eviction, the process dying), step 4 never runs at all,
+and without step 2 the pre-update rule would sit in the cache for the full 600s with nothing
+left to clear it.
+
+What neither step can do is stop a request that read MySQL *before* this update from writing
+what it read into the cache *after* step 4. No ordering of deletes can: when the last delete
+runs, that write has not happened yet. Closing it needs the reader to notice the change for
+itself, which §6.6 takes up once the cache has been described — and steps 2 and 4 are also
+where the mechanism it uses is refreshed.
 
 ---
 
@@ -312,7 +374,7 @@ A Lua script therefore runs the whole sequence in one pass inside Redis.
 ### 5.3 `check_and_incr.lua` (used by `/check`)
 
 ```lua
--- KEYS[1] = counter key
+-- KEYS[1] = rate_limit:counter:{apiKey}:c{createdAtEpochMs}:v{version}
 -- ARGV[1] = limit, ARGV[2] = windowSeconds
 -- returns { allowed(1/0), usage, ttl }
 local limit  = tonumber(ARGV[1])
@@ -369,7 +431,7 @@ When the key does not exist, `usage = 0` and the TTL is normalised to `0` by the
 args/result serializer to `execute()`). Spring Boot's `RedisAutoConfiguration` already
 declares it, so `RedisConfig` **does not redeclare it** — the auto-configured bean is
 `@ConditionalOnMissingBean`, and a copy of it would be identical to the one it replaces.
-`RedisConfig` contributes only the two script beans and documents the rule above.
+`RedisConfig` contributes only the script beans and documents the rule above.
 
 Why: `RedisTemplate.execute(script, keys, args)` serialises ARGV with the template's
 **value serializer**. With the common Spring Boot pairing of
@@ -381,8 +443,13 @@ next comparison throws `attempt to compare number with nil` — `/check` fails o
 straight through Spring's `ScriptUtils`). Always read them as
 `((Number) result.get(i)).longValue()`; casting to `(Integer)` is a `ClassCastException`.
 
-The config cache (a JSON string) and the counter (an integer string) both operate on the
-same `StringRedisTemplate`, so two serializers never collide.
+A third trap of the same family — how a key that is *absent* reads inside Lua — cannot bite
+either of these two scripts, because both are handed a counter key they are willing to treat
+as zero. It appears only once a script has to tell "no value" apart from a value, which is
+§6.6's guard, and it is described there.
+
+The config cache (a JSON string) and the counter (an integer string) both operate on the same
+`StringRedisTemplate`, so two serializers never collide.
 
 `DefaultRedisScript` uses `EVALSHA`; Spring reloads the script automatically on
 `NOSCRIPT`.
@@ -399,15 +466,19 @@ storage, not a high-frequency read path.
 
 ```
 Redis GET config ──HIT──► use it
-        └────────MISS───► MySQL SELECT ──► Redis SETEX(600s) ──► use it
+        └────────MISS───► read guard token ──► MySQL SELECT ──► guarded SET(600s) ──► use it
 ```
+
+The guarded write on the miss branch is §6.6; a plain `SETEX` there is the classic
+cache-aside defect, and the reason is spelled out in that section.
 
 MySQL remains the durable source of truth; the Redis copy can be rebuilt from it at any
 time.
 
 **Why not Spring Cache's `@Cacheable`**: this design needs precise control over key naming
-(versioning), TTL, and the in-flight coalescing in §6.3 — none of which `@Cacheable` can
-express, single-flight least of all. A hand-written cache-aside encapsulated in
+(versioning), two different TTLs, the in-flight coalescing in §6.3, and a write-back that can
+refuse to run (§6.6) — none of which `@Cacheable` can express, single-flight and a conditional
+write least of all. A hand-written cache-aside encapsulated in
 `RateLimitConfigCache` also satisfies the "RedisTemplate encapsulation" bonus item.
 
 ### 6.2 Lazy loading on cold start
@@ -416,7 +487,7 @@ Redis loses all cached config after a restart. The application **does not** need
 every rule into Redis at startup:
 
 ```
-first request after restart -> Redis MISS -> MySQL -> Redis SET -> use it
+first request after restart -> Redis MISS -> MySQL -> guarded Redis SET -> use it
 ```
 
 This avoids running `SELECT * FROM rate_limit_rule` at boot and writing potentially
@@ -524,16 +595,99 @@ Three points:
 
 1. **The sentinel must be impossible to confuse with real JSON.** A leading `\0` works: a
    valid Redis string, but never something `ObjectMapper` would produce.
-2. **The TTL must be short** (30s, versus 600s for the positive cache). It bounds the
-   window in which "the rule was just created but the cache still says it does not exist".
-3. **No extra invalidation logic is needed.** `POST /limits` already deletes
-   `rate_limit:config:{apiKey}` (§4.4 step 3), and the tombstone uses that very same key —
+2. **The TTL is short** (30s, versus 600s for the positive cache). On its own it would be
+   the only thing bounding the window in which "the rule was just created but the cache still
+   says it does not exist". §6.6 closes that window outright instead: the tombstone is written
+   through the same guarded path as any other value, so one that lost a race with
+   `POST /limits` is simply dropped. The short TTL remains as defence in depth.
+3. **No extra invalidation logic is needed.** `POST /limits` already invalidates
+   `rate_limit:config:{apiKey}` (§4.5), and the tombstone uses that very same key —
    creating a rule automatically clears its own tombstone.
 
 A pleasant side effect: the single-flight in §6.3 coalesces *before* the database read, so
 concurrent requests for the same non-existent key still produce exactly one query, and
 `RuleNotFoundException` propagates to every rider. **Negative lookups inherit the same
 stampede protection as positive ones, with no extra code.**
+
+### 6.6 Write-back fencing
+
+Everything above is cache-aside, and cache-aside has one well-known way of going wrong:
+
+```
+R (/check, cache miss)                       W (POST /limits)
+------------------------------------------------------------------
+GET config            -> miss
+SELECT  -> {v7, limit 100}
+                                             UPSERT -> v8, limit 50  (COMMIT)
+                                             DEL config
+SET config {v7, limit 100} EX 600
+```
+
+Redis now serves v7 / limit 100 for the full 600s while MySQL says v8 / limit 50 — a rule
+change that silently never takes effect. With `DELETE` in place of `POST`, a deleted rule
+keeps being enforced instead.
+
+**Evicting earlier cannot fix this.** An eviction happens at a point in time and the
+poisoning write happens after it, so no ordering of deletes on the writer's side can beat a
+write that has not happened yet. That is worth stating plainly because the obvious fixes —
+"delete before the write as well", "delete again afterwards" — all address a different race
+(one where the reader's `SET` has *already* landed) and leave this one untouched. The reader
+has to be the one that notices.
+
+So it is given something to notice with: a per-rule guard token, replaced on every write.
+
+```
+rate_limit:epoch:{apiKey}    a UUID    TTL 600s
+```
+
+**The writer** replaces the token and clears the derived keys in one round trip
+(`invalidate.lua`), **after** the MySQL statement has committed. **The reader** captures the
+token *before* its `SELECT` and presents it on the way back; the write-back script
+(`cache_put.lua`) stores the value only if the token is still the same one.
+
+Why that is sufficient — writing `t_c` for the writer's commit, `t_b` for its token
+replacement, `t_e` for the reader's capture and `t_s` for its `SELECT`, we have `t_e < t_s`
+and `t_c < t_b` by construction:
+
+| Case | Consequence |
+| --- | --- |
+| `t_e < t_b` | the token moved after capture → **rejected**. Sometimes conservative, since the reader may have selected after the commit anyway; a conservative rejection costs one extra MySQL read on the next request and is never incorrect |
+| `t_b < t_e` | then `t_c < t_b < t_e < t_s`, so the `SELECT` strictly follows the commit and the reader holds the new row → **accepted**, correctly |
+
+There is no third case, so a stale value cannot reach the cache.
+
+Five details carry the whole thing:
+
+1. **The writer re-tokens after the commit; the reader captures before the `SELECT`.**
+   Reverse either and the second case collapses — a reader could hold the new token, read the
+   old row, and be accepted.
+2. **The token is a UUID, not a counter.** `INCR` on an expired key restarts at `1`, so a
+   reader holding `1` from an earlier generation would match a fresh `1`. A UUID never
+   repeats; the only repeat is absent→absent, which genuinely means nothing was written.
+3. **Serving is not gated by the token.** A rejected write-back still returns what the reader
+   read — only the caching is dropped. This is §11.4's semantic, not a new one.
+4. **"No token yet" must be spelled the same way on both sides.** This is the third trap
+   promised in §5.5, and it is the quietest of the three. A key that does not exist comes back
+   from `GET` as boolean `false` in Lua and as `null` in Java, and neither equals the other:
+   the script normalises `false` to `''`, the caller normalises `null` to `""`, and a rule
+   nobody has written yet then matches itself. Skip either normalisation and **nothing
+   raises** — `/check` keeps answering from the row it already selected, while every
+   write-back for a cold key is refused, the cache never populates, and every request reaches
+   MySQL. A cache that has silently stopped being a cache looks exactly like a working one.
+   The empty string is safe as the sentinel because a real token is always a UUID.
+5. **The invalidation writes the epoch key rather than deleting it.** It is the eviction
+   path, so clearing every key in sight is the reflex, but an absent token matches the empty
+   sentinel of the previous point — which a stale reader may be holding — and would hand that
+   reader an accepted write-back, reopening the race.
+
+**The cost lands entirely on the miss path** — one extra `GET` before the database read,
+which the single-flight of §6.3 already collapses to one execution per key. A cache *hit*,
+which is the overwhelming majority of `/check` traffic, is still a single `GET` and touches
+none of this.
+
+The residual is recorded in §14.10: a bypass needs a reader stalled longer than the guard's
+own 600s TTL between capturing the token and writing back, against a 2s single-flight
+timeout.
 
 ---
 
@@ -552,23 +706,27 @@ GET /check?apiKey=abc-123
     HIT     tombstone        MISS ──► single-flight coalescing (§6.3)
      │         │              │
      │         ▼              ▼
-     │   404 RuleNotFound  MySQL SELECT
+     │   404 RuleNotFound  GET rate_limit:epoch:abc-123   <- guard token, before the SELECT
      │   (MySQL untouched)    │
+     │                        ▼
+     │                   MySQL SELECT
+     │                        │
      │                   ┌─────┴─────┐
      │                 found      not found
      │                   │           │
      │                   ▼           ▼
-     │          Redis SETEX 600s   write tombstone EX 30s (§6.5)
+     │        guarded SET 600s   guarded tombstone EX 30s (§6.5)
+     │        (dropped if the token moved -- §6.6)
      │                   │           │
      │                   │           ▼
      │                   │    404 RuleNotFound
      └────────┬──────────┘
           │
           ▼
-   obtain { version, limit, windowSeconds }
+   obtain { createdAtEpochMs, version, limit, windowSeconds }
           │
           ▼
-   build counter key: rate_limit:counter:abc-123:v7
+   build counter key: rate_limit:counter:abc-123:c1787670000000:v7
           │
           ▼
    EVALSHA check_and_incr.lua  <- atomic: compare -> increment -> set TTL on first
@@ -594,11 +752,17 @@ paths directly.
 
 | Method | Path | Success | Failure |
 | --- | --- | --- | --- |
-| POST | `/limits` | `201` created / `204` updated (both without a body) | `400` |
+| POST | `/limits` | `201` created / `204` updated (both without a body) | `400`, `503` |
 | GET | `/check?apiKey=` | `200` | `429` over limit, `404` no rule, `503` |
 | GET | `/usage?apiKey=` | `200` | `404`, `503` |
-| DELETE | `/limits/{apiKey}` | `204` | `404` |
+| DELETE | `/limits/{apiKey}` | `204` | `404`, `503` |
 | GET | `/limits?page=0&size=20` | `200` | `400` |
+
+**Both write endpoints can answer `503`, and it means something specific.** Each of them
+touches Redis *after* MySQL, so a Redis outage surfaces with the row already written or
+already deleted. Retrying is safe: the upsert is idempotent apart from `version` advancing,
+and a repeated `DELETE` answers `404` once the row is gone. In the meantime the cached copy
+may disagree with the table, bounded by the 600s TTL fuse of §3.3.
 
 ### POST `/limits`
 
@@ -622,21 +786,25 @@ was never sent.
 On success: atomic upsert into the database (version + 1), then delete the Redis config
 cache.
 
-**`save` must not be `@Transactional` either, for the mirror-image reason.** The eviction
-has to happen after the upsert *commits*, not merely after the statement executes. Inside a
-transaction the sequence becomes:
+**`save` must not be `@Transactional` either, for the mirror-image reason.** The
+invalidation has to happen after the upsert *commits*, not merely after the statement
+executes. Inside a transaction the sequence becomes:
 
 ```
   BEGIN
     INSERT ... ON DUPLICATE KEY UPDATE   (uncommitted -- the old row is still what
-    DEL config                            other sessions see)
+    invalidate                            other sessions see)
                                          <-- /check here: cache miss, reads the OLD row,
-                                             caches the OLD limit for 600s
+                                             and holds a token issued before the commit
   COMMIT
 ```
 
-Nothing evicts that entry afterwards, so the rule change silently does not take effect for
-up to ten minutes. The transaction adds nothing to weigh against this: the upsert is a
+The guard of §6.6 is what makes this concrete rather than merely untidy: its entire premise
+is that a token replacement follows the commit, so a reader still holding the old token must
+have selected beforehand. Move the replacement *inside* the transaction and that stops being
+true — the reader above captured its token after the replacement and still read the old row,
+so its write-back is accepted and the old limit is cached for ten minutes. A transaction here
+does not weaken a safeguard by accident; it inverts the ordering the safeguard is built on. The transaction adds nothing to weigh against this: the upsert is a
 single statement and therefore already atomic (§11.2), and under autocommit its row lock is
 released before the Redis call rather than being held across it.
 
@@ -735,26 +903,31 @@ The brief requires clearing the related Redis entries. The ordering is deliberat
 **delete cache, delete database, delete cache again**:
 
 ```
-1. Read the rule from the database (to obtain version); 404 if absent
-2. Redis DEL rate_limit:config:{apiKey} rate_limit:counter:{apiKey}:v{version}
+1. Read the rule from the database (to obtain `created_at` and `version`); 404 if absent
+2. Redis: invalidate — DEL rate_limit:config:{apiKey} and
+   rate_limit:counter:{apiKey}:c{createdAtEpochMs}:v{version}, SET a new guard token
 3. MySQL DELETE
-4. Redis DEL (repeat step 2)
+4. Redis: invalidate again (repeat step 2)
 ```
 
-Step 2 is **one multi-key `DEL`**, not two commands and not `RateLimitConfigCache.evict`
-plus a second call: the flow runs it twice, so that is two round trips rather than four.
-`RedisKeys` is what keeps this call site building byte-for-byte the strings the cache
-wrote.
+Steps 2 and 4 are **one round trip each**, not three. Both go through
+`RateLimitConfigCache.invalidate`, whose script replaces the guard token and deletes the
+config entry and the counter together — the flow runs it twice, so that is two round trips
+rather than six. Routing it through the cache rather than issuing a bare `DEL` here is also
+what stops this call site from clearing keys without replacing the token, which would leave
+§6.6's guard inert for the delete path with nothing to indicate it. `RedisKeys` is what keeps
+the call site building byte-for-byte the strings the cache wrote.
 
 **Step 3 deleting 0 rows is not a `404`.** Only the step-1 read produces one. Zero rows
 there means a concurrent `DELETE` for the same key won the race after our read — the
 caller's intent is satisfied either way, and answering `404` would make the outcome depend
 on which request the database happened to serve first, as well as skipping step 4.
 
-Because the counter key carries a version, `version` must be read first to delete it
-precisely. **No `KEYS` or `SCAN` wildcard matching** — `KEYS` blocks the whole Redis
-instance and `SCAN` needs multiple round trips; neither is acceptable in production. With
-the version known it is a single `DEL`.
+Because the counter key carries the rule's incarnation and version, both must be read before
+it can be named precisely — which is what step 1 is for, beyond producing the `404`. **No
+`KEYS` or `SCAN` wildcard matching** — `KEYS` blocks the whole Redis instance and `SCAN` needs
+multiple round trips; neither is acceptable in production. With both values known it is a
+single `DEL`.
 
 **Why this order**: the cache is derived data, and deleting derived data first is safe in
 every case.
@@ -764,9 +937,16 @@ every case.
 | Step 3 fails (MySQL delete does not happen) | Cache gone, rule still present -> the next `/check` rebuilds it from MySQL -> **fully self-healing, zero inconsistency** |
 | The reverse order (MySQL first, then Redis) with a Redis failure | Rule gone but cache remains -> keeps rate limiting for up to 600 seconds |
 
-Step 4 closes a race: between steps 2 and 3 a concurrent `/check` may repopulate the cache
-from MySQL. One extra line shrinks the inconsistency window from "up to 600 seconds" to "a
-few milliseconds".
+Step 4 covers a concurrent `/check` that repopulated the cache between steps 2 and 3: its
+`SET` has already landed, so repeating the delete removes it.
+
+**Step 4 does not close the race on its own, and it is worth being precise about why.** A
+reader that *selected* between steps 2 and 3 but writes back after step 4 is untouched by it —
+step 4 cannot delete a value that has not been written yet. No ordering of deletes on this
+side can, which is the argument §6.6 makes at length. What actually closes it is the guard
+token step 2 and step 4 each install: that reader presents a token from before step 2, and its
+write-back is refused. Step 4 remains worth its one line for the case it does cover, and the
+600s TTL of §3.3 remains the backstop for anything neither mechanism catches.
 
 **The Redis operations are not wrapped in `@Transactional` to roll back MySQL.** It is
 mechanically possible but delivers fake atomicity: a Redis timeout does not mean the DEL
@@ -911,7 +1091,7 @@ the moment protection fails removes the only defence at the most fragile moment.
 ### 9.3 Counters are ephemeral state
 
 This design treats the counter explicitly as **state that may be lost**. If Redis loses
-its data, `counter:abc-123:v7` is gone and **cannot be rebuilt from MySQL**.
+its data, `counter:abc-123:c{created}:v7` is gone and **cannot be rebuilt from MySQL**.
 
 Preserving exact counter state across a Redis failure would require Redis persistence or
 replication, or a durable request event log — all outside the scope of this assignment.
@@ -1170,6 +1350,13 @@ semantic is:
 
 > An in-flight request may complete using the configuration version it observed.
 
+That is a statement about **serving**, and it is worth separating from **caching**. With the
+guard of §6.6 in place, a request may still answer from a version it observed just before a
+change, but it can no longer write that version into the cache for every request behind it.
+The gap between those two is the whole reason the guard exists: "one request sees the old
+limit" is the accepted semantic above, while "every request sees the old limit for ten
+minutes" would be a rule change that silently never took effect.
+
 Requests that observe the new version use the new counter. This avoids needing a
 distributed lock around every rule change, and since windows are typically tens of
 seconds, the inconsistency window is both extremely short and harmless.
@@ -1395,7 +1582,7 @@ keeps the scaffold's image.
 ```
 com.example.demo
 ├── DemoApplication.java
-├── config/       RedisConfig (two DefaultRedisScript beans) · RocketMQConfig
+├── config/       RedisConfig (four DefaultRedisScript beans) · RocketMQConfig
 ├── controller/   RateLimitRuleController (/limits) · RateLimitCheckController (/check, /usage)
 ├── service/      RateLimitRuleService · RateLimitCheckService · RateLimitConfigCache · RedisKeys
 ├── repository/   RateLimitRuleRepository (JdbcClient)
@@ -1441,6 +1628,8 @@ time budget of this assignment:
 | 14.6 | Fixed-window algorithm | At a window boundary the worst case admits close to twice the intended traffic; this is not a token bucket or sliding window |
 | 14.7 | Negative caching only stops repeated keys | The tombstone in §6.5 stops the same non-existent key being queried repeatedly, but not an attack using a **fresh random** apiKey every time — each of those is a first miss. A complete answer needs existence pre-filtering such as a bloom filter |
 | 14.8 | MQ volume equals `/check` volume | Publishing every outcome (§10.1) means one message per request, unsampled and unbatched. `DefaultMQProducer` bounds in-flight async sends with a semaphore (`clientAsyncSemaphoreValue`, default 65535); sustained overload starts rejecting sends, and since rejections are logged and dropped, the log becomes the next bottleneck. The same volume problem reaches the consumer's log in one specific case: `REQUEST_BLOCKED` is logged at `INFO` (§10.4) on the assumption that refusals are comparatively rare, which stops being true while a key is under sustained attack — precisely when every one of those lines is least useful. Bounding it would need the log itself to be rate limited (once per key per interval), which is deliberately not built here. Fine at assignment scale; mitigations are named in §15 |
+| 14.9 | The incarnation discriminator is millisecond-resolution | `created_at` is `DATETIME(3)`, so two incarnations of one API key created in the same millisecond share a counter namespace. Reaching it also needs the earlier incarnation to have left counters at two or more versions, since `DELETE` removes precisely the one it was on (§4.3) — unreachable across HTTP round trips, and recorded rather than engineered against. `DATETIME(6)` would close it at the cost of a schema change |
+| 14.10 | The write-back guard is bounded by its own TTL | The token of §6.6 expires after 600s. A reader stalled longer than that between capturing its token and writing back would find the key absent, match the empty sentinel and be accepted — against a 2s single-flight timeout, so the margin is roughly 300x. Removing the bound entirely would mean a key per API key that never expires |
 
 ---
 
@@ -1467,6 +1656,13 @@ If this service needed to run at significantly larger scale:
   the cost of per-request granularity and of events becoming snapshots rather than facts
 - **Durable usage analytics**: a separate consumer and storage layer fed by RocketMQ
   events, retaining historical usage
+- **Write-back staleness beyond §6.6**: the guard is already deterministic, so the usual
+  production answer — a *delayed double delete*, where the writer schedules a third
+  invalidation a few hundred milliseconds later — was considered and **rejected** here. It is
+  probabilistic (it only catches readers slower than the chosen delay), it is lost if the
+  process dies, and it would need scheduling infrastructure this application otherwise has
+  none of. It remains the right tool where a fencing token cannot be threaded through the
+  read path; it is not needed where one can
 - **Rule listing at scale**: the `(created_at DESC, api_key)` index (§3.1) already matches
   the sort; what remains is replacing `OFFSET` with keyset pagination, so that deep pages
   stop reading everything they skip over
@@ -1481,6 +1677,7 @@ If this service needed to run at significantly larger scale:
 | Redis caches rules | Avoids hitting MySQL on every `/check` |
 | Redis stores counters | Fast atomic increments |
 | Counter keys carry a version | A rule change naturally starts a new counter, sidestepping "what happens to the old one" |
+| Counter keys also carry the rule's `created_at` | `version` is only bumped by the upsert, so a hard delete followed by a re-insert resets it to 1 and the recreated rule would re-address its predecessor's counters — refusing its own first request. `created_at` survives every update and is fresh on re-insert, which is exactly the discriminator needed. Naming the key correctly beats sweeping `v1..vN`, which would be the cleanup mechanism §4.4 exists to avoid and would fail open whenever the Redis half of a `DELETE` does |
 | Counter TTL handles cleanup | No additional cleanup mechanism required |
 | 600s TTL on the config cache | A fuse for a failed delete, bounding the worst case |
 | Config miss reads through to MySQL | Straightforward cache-aside |
@@ -1504,7 +1701,10 @@ If this service needed to run at significantly larger scale:
 | UTC+8 pinned across the chain (server + connection) | Mismatched offsets shift times silently by hours; pinning at both layers plus a round-trip test turns that into a caught error. The server side must use `+08:00`, since `Asia/Taipei` fails to start without the time-zone tables loaded |
 | `connectionTimeZone` rather than `serverTimezone` | On connector 9.2.0 the latter is a deprecated 5.x-era alias not worth betting on |
 | DELETE removes exactly two keys | The brief requires clearing Redis; `KEYS`/`SCAN` are avoided |
-| DELETE order: Redis -> MySQL -> Redis | The cache is derived data, so deleting it first is always safe; a MySQL failure then self-heals completely. The third step closes the race where a concurrent `/check` repopulates the cache |
+| DELETE order: Redis -> MySQL -> Redis | The cache is derived data, so deleting it first is always safe; a MySQL failure then self-heals completely. The third step catches a concurrent `/check` whose write has already landed — the one whose write is still to come is caught by the guard token instead, not by any ordering of deletes |
+| `POST /limits` invalidates before and after the write | Symmetry with DELETE, but for its own reason: the call after the upsert is what re-tokens post-commit and makes the guard sound, while the call before covers an upsert that commits and then throws, where the second call never runs. Neither narrows the read-repopulate window; only the guard does |
+| A per-rule guard token fences cache write-backs | The reader captures it before its SELECT and the writer replaces it after the commit, so a value read before a change cannot be cached after it. Evicting earlier cannot achieve this — an eviction happens at a point in time and the poisoning write happens after it. Chosen over a delayed double delete, which is probabilistic where this is deterministic (§15) |
+| The token is a UUID, not a counter | `INCR` restarts at 1 on an expired key, so a reader holding a stale `1` could match a fresh `1`. A UUID never repeats |
 | Redis operations not wrapped in a DB transaction | A timeout does not mean it did not run, the two DELs are not atomic, and a cross-system call inside a transaction lengthens row locks — that is fake atomicity |
 | 429 returns `CheckResponse`, not `ProblemDetail` | "No" is a successful answer from `/check`; a throttled client needs `remaining` and the TTL most |
 | MQ timestamps as epoch millis | Keeps the event DTO purely primitive so any `ObjectMapper` can serialise it, removing the `JavaTimeModule` trap |
@@ -1520,3 +1720,4 @@ If this service needed to run at significantly larger scale:
 | No distributed lock on rule changes | Complexity out of proportion to the assignment |
 
 ---
+

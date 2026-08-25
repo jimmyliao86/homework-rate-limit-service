@@ -57,8 +57,8 @@ class RateLimitEndToEndTest {
 
     /**
      * The containers are shared across the whole run, so state is cleared here rather than
-     * relied upon to be absent. Redis is wiped by prefix because the counter key carries a
-     * version this test cannot predict before the rule exists.
+     * relied upon to be absent. Redis is wiped by prefix because the counter key carries an
+     * incarnation and a version, neither of which this test can predict before the rule exists.
      */
     @BeforeEach
     void clearState() {
@@ -73,6 +73,9 @@ class RateLimitEndToEndTest {
         assertThat(createRule(LIMIT, WINDOW_SECONDS).getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
         long version = firstAllowedRequestReportsVersion();
+        // Read while the row still exists: the delete below is what this test is checking,
+        // and the counter key has to be nameable after it is gone.
+        long createdAtMs = createdAtMs();
 
         // The remaining two of the three permitted requests.
         for (int i = 2; i <= LIMIT; i++) {
@@ -103,7 +106,7 @@ class RateLimitEndToEndTest {
         assertThat(usage.getBody().remaining()).isZero();
         assertThat(usage.getBody().version()).isEqualTo(version);
         assertThat(usage.getBody().windowTtlSeconds()).isPositive().isLessThanOrEqualTo(WINDOW_SECONDS);
-        assertThat(redis.opsForValue().get(RedisKeys.counter(API_KEY, version)))
+        assertThat(redis.opsForValue().get(RedisKeys.counter(API_KEY, createdAtMs, version)))
                 .as("/usage peeks; the counter in Redis is untouched by it")
                 .isEqualTo(String.valueOf(LIMIT));
 
@@ -114,7 +117,7 @@ class RateLimitEndToEndTest {
         assertThat(redis.hasKey(RedisKeys.config(API_KEY)))
                 .as("the cached config must go, or the deleted rule would keep being enforced")
                 .isFalse();
-        assertThat(redis.hasKey(RedisKeys.counter(API_KEY, version)))
+        assertThat(redis.hasKey(RedisKeys.counter(API_KEY, createdAtMs, version)))
                 .as("the counter must go too, or a re-created rule at the same version would "
                         + "inherit the old usage")
                 .isFalse();
@@ -150,6 +153,55 @@ class RateLimitEndToEndTest {
                 .isEqualTo(1);
     }
 
+    /**
+     * A rule that is deleted and created again must start from nothing.
+     *
+     * <p>This is not {@link #updateStartsANewWindow()} with extra steps, and the difference is
+     * the whole point. {@code version} is only incremented by {@code ON DUPLICATE KEY UPDATE},
+     * so once the row is gone the next {@code POST} is a plain insert and the version
+     * <strong>resets to 1</strong> -- while {@code DELETE} only removed the counter of the
+     * version the rule held at the time. Any earlier version's counter is still in Redis on
+     * its own TTL, and a key built from the API key and the version alone would address it
+     * again: the recreated rule would answer {@code 429} on the first request it ever served.
+     *
+     * <p>What stops it is the rule's {@code created_at} in the counter key. It is preserved
+     * across updates but fresh on re-insert, so no incarnation of a rule can name another's
+     * counters -- and no cleanup mechanism is needed to achieve that.
+     */
+    @Test
+    @DisplayName("a deleted and recreated rule starts clean, even though an earlier counter outlives it")
+    void recreatedRuleDoesNotInheritAnEarlierIncarnationsCounter() {
+        // Fill version 1 to its limit, then move the rule on to version 2. The window is long
+        // enough that nothing here can expire on its own while the test runs.
+        assertThat(createRule(LIMIT, WINDOW_SECONDS).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        for (int i = 1; i <= LIMIT; i++) {
+            assertThat(check().getStatusCode()).as("request %d of %d", i, LIMIT).isEqualTo(HttpStatus.OK);
+        }
+        assertThat(createRule(LIMIT, WINDOW_SECONDS).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(check().getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        rest.exchange("/limits/{k}", org.springframework.http.HttpMethod.DELETE, null, Void.class, API_KEY);
+
+        // The premise, asserted rather than assumed: DELETE clears the counter of the version
+        // the rule was on, not the one it left behind on the way there. If that ever changes,
+        // this test stops exercising anything and should fail here rather than pass quietly.
+        assertThat(redis.keys("rate_limit:counter:*"))
+                .as("a counter from the rule's first version outlives the delete, on its own TTL")
+                .isNotEmpty();
+
+        // Recreate: a plain insert, so the version is back to 1.
+        assertThat(createRule(LIMIT, WINDOW_SECONDS).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        ResponseEntity<CheckResponse> first = check();
+        assertThat(first.getStatusCode())
+                .as("the first request against a rule that has never served one must not be refused")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(first.getBody().usage())
+                .as("the recreated rule counts from scratch rather than inheriting its predecessor's usage")
+                .isEqualTo(1);
+        assertThat(first.getBody().remaining()).isEqualTo(LIMIT - 1L);
+    }
+
     private ResponseEntity<Void> createRule(int limit, int windowSeconds) {
         return rest.postForEntity("/limits",
                 Map.of("apiKey", API_KEY, "limit", limit, "windowSeconds", windowSeconds),
@@ -158,6 +210,23 @@ class RateLimitEndToEndTest {
 
     private ResponseEntity<CheckResponse> check() {
         return rest.getForEntity("/check?apiKey={k}", CheckResponse.class, API_KEY);
+    }
+
+    /**
+     * The rule's {@code created_at} as epoch millis -- the incarnation half of the counter key.
+     *
+     * <p>Read from MySQL rather than from the API on purpose. It is deliberately not part of
+     * any response: it is an internal discriminator, and the point of {@code POST} returning
+     * no body is that internal mechanics do not leak into the contract. A test that needs it
+     * can go to the source of truth.
+     */
+    private long createdAtMs() {
+        return jdbcClient.sql("SELECT created_at FROM rate_limit_rule WHERE api_key = :k")
+                .param("k", API_KEY)
+                .query(java.time.OffsetDateTime.class)
+                .single()
+                .toInstant()
+                .toEpochMilli();
     }
 
     /** The first {@code /check} after a write, which is also where the live version is read from. */

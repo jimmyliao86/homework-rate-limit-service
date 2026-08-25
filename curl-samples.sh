@@ -63,19 +63,27 @@ status "$BASE/limits?page=0&size=1000000"
 section "9. DELETE /limits/{apiKey} -- 204"
 status -X DELETE "$BASE/limits/$API_KEY"
 
-section "10. Redis holds no keys for this API key any more"
+section "10. Redis: the config cache and the counter are gone"
+# The rule row, the cached config and the counter of the version the rule was on have all
+# been removed. The epoch key stays: it is the write-back guard (DESIGN.md 6.6), and an
+# invalidation writes it rather than deleting it -- an absent token would match the empty
+# sentinel an in-flight reader may be holding. A counter from an earlier version of the
+# same rule could also survive here on its own TTL; this script never creates one, but a
+# POST / check / POST / check / DELETE sequence by hand would.
 docker exec redis redis-cli KEYS 'rate_limit:*' 2>/dev/null || \
   echo "(skipped: the 'redis' container is not reachable from here)"
 
 section "11. GET /check after the delete -- 404 problem+json"
 curl -s "$BASE/check?apiKey=$API_KEY" | pretty
 
-section "12. Redis now holds a negative-cache tombstone, which is expected"
+section "12. Redis now also holds a negative-cache tombstone, which is expected"
 # The 404 above read through to MySQL, found nothing, and cached that absence for 30s
 # so a flood of unknown keys cannot reach the database (see DESIGN.md 6.5). The value
 # is the sentinel "\0ABSENT", never valid JSON, and POST /limits deletes this very key.
+# Expect two keys now: the tombstone (TTL <= 30) and the epoch guard (TTL <= 600).
 docker exec redis redis-cli KEYS 'rate_limit:*' 2>/dev/null
 docker exec redis redis-cli TTL "rate_limit:config:$API_KEY" 2>/dev/null
+docker exec redis redis-cli TTL "rate_limit:epoch:$API_KEY" 2>/dev/null
 
 printf '\nDone. RocketMQ events are visible in the application log (the consumer writes an\n'
 printf 'audit line per event) and on the console at http://localhost:8088 under the\n'

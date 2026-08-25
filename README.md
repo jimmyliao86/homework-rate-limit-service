@@ -18,7 +18,7 @@ docker compose up -d          # MySQL, Redis, RocketMQ
 ./curl-samples.sh             # the whole contract, end to end
 ```
 
-Requires JDK 21 and Docker. `./mvnw test` runs 92 tests against Testcontainers-backed
+Requires JDK 21 and Docker. `./mvnw test` runs 100 tests against Testcontainers-backed
 MySQL and Redis.
 
 ## API
@@ -48,11 +48,18 @@ asynchronously and never on the critical path: if the broker is down, the API is
 
 Two decisions carry most of the weight:
 
-- **Versioned counter keys.** Each rule row has a `version`, and the counter key embeds it
-  (`rate_limit:counter:{apiKey}:v7`). Changing a rule increments the version, so the next
-  request writes to a *different* key and the quota resets with no counter deletion, no
-  scan, and no window in which a stale count is enforced against a new limit. Old keys expire
-  on their own TTL.
+- **The counter key names the rule it belongs to.** It embeds both the rule's `version` and
+  its `created_at` (`rate_limit:counter:{apiKey}:c1787670000000:v7`). Changing a rule bumps
+  the version, so the next request writes to a *different* key and the quota resets with no
+  counter deletion and no scan. `created_at` covers what the version cannot: a hard delete
+  followed by a re-insert takes the version back to 1, and without it a recreated rule would
+  inherit its predecessor's counter and refuse its own first request. Old keys expire on
+  their own TTL, unreachable by construction rather than merely ignored.
+- **Cache write-backs are fenced.** A reader that missed the cache takes a guard token before
+  it reads MySQL and presents it when it writes back; a write to that rule replaces the token,
+  and the write-back is dropped. Without it, a reader that selected just before a rule change
+  could cache the superseded rule *after* the change evicted it — and no ordering of evictions
+  on the writer's side can prevent that, because the poisoning write has not happened yet.
 - **Fail closed.** If Redis is unavailable, `/check` returns `503` rather than falling back
   to MySQL or letting traffic through. MySQL does not hold current usage and could not serve
   it at this rate anyway, and a rate limiter that opens the gates the moment its state store

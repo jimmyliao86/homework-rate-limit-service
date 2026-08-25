@@ -9,7 +9,8 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 
 /**
- * The two Lua scripts that carry the rate limit algorithm.
+ * The four Lua scripts this service runs: two that carry the rate limit algorithm, and two
+ * that keep the config cache consistent.
  *
  * <p>{@link DefaultRedisScript} loads the file once, executes it through {@code EVALSHA}
  * and lets Spring resend the body automatically when Redis answers {@code NOSCRIPT} (after
@@ -26,9 +27,10 @@ import org.springframework.data.redis.core.script.RedisScript;
  * config cache stores JSON and the counters store integers, but both are plain strings, so
  * one string-serialised template serves them both.
  *
- * <p>Both scripts return a Redis integer array, which reaches Java as a
+ * <p>The two counter scripts return a Redis integer array, which reaches Java as a
  * {@code List} of {@link Long}. Read the elements as {@code ((Number) e).longValue()};
- * casting to {@code Integer} throws {@link ClassCastException}.
+ * casting to {@code Integer} throws {@link ClassCastException}. The two cache scripts
+ * return a single integer and are declared {@code RedisScript<Long>} instead.
  */
 @Configuration
 public class RedisConfig {
@@ -43,21 +45,41 @@ public class RedisConfig {
     @Bean
     @SuppressWarnings("rawtypes")
     public RedisScript<List> checkAndIncrScript() {
-        return script("redis/check_and_incr.lua");
+        return script("redis/check_and_incr.lua", List.class);
     }
 
     /** Read-only counter snapshot for {@code GET /usage}. */
     @Bean
     @SuppressWarnings("rawtypes")
     public RedisScript<List> peekScript() {
-        return script("redis/peek.lua");
+        return script("redis/peek.lua", List.class);
     }
 
-    @SuppressWarnings("rawtypes")
-    private static RedisScript<List> script(String location) {
-        DefaultRedisScript<List> script = new DefaultRedisScript<>();
+    /**
+     * Guarded write-back for the config cache: caches a rule or a tombstone only if no write
+     * to that rule landed while MySQL was being read.
+     *
+     * <p>Returns a count rather than an array, so unlike the two counter scripts its result
+     * type is {@code Long}.
+     */
+    @Bean
+    public RedisScript<Long> cachePutScript() {
+        return script("redis/cache_put.lua", Long.class);
+    }
+
+    /**
+     * The writer's counterpart: drops the derived keys for one rule and stamps it with a new
+     * guard token, in one round trip.
+     */
+    @Bean
+    public RedisScript<Long> invalidateScript() {
+        return script("redis/invalidate.lua", Long.class);
+    }
+
+    private static <T> RedisScript<T> script(String location, Class<T> resultType) {
+        DefaultRedisScript<T> script = new DefaultRedisScript<>();
         script.setLocation(new ClassPathResource(location));
-        script.setResultType(List.class);
+        script.setResultType(resultType);
         return script;
     }
 }

@@ -57,8 +57,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 class RateLimitCheckServiceTest {
 
     private static final String API_KEY = "abc-123";
-    private static final RateLimitConfig CONFIG = new RateLimitConfig(7, 100, 60);
-    private static final String COUNTER_KEY = "rate_limit:counter:abc-123:v7";
+    private static final long CREATED_AT_MS = 1787670000000L;
+    private static final RateLimitConfig CONFIG = new RateLimitConfig(CREATED_AT_MS, 7, 100, 60);
+
+    /**
+     * Spelled out rather than built through {@link RedisKeys}, so that a change to the key
+     * layout has to be made deliberately in both places instead of silently agreeing with
+     * itself. Both discriminators are present: the incarnation and the version.
+     */
+    private static final String COUNTER_KEY = "rate_limit:counter:abc-123:c" + CREATED_AT_MS + ":v7";
 
     private final RedisConfig scripts = new RedisConfig();
     private final RedisScript<List> checkAndIncrScript = scripts.checkAndIncrScript();
