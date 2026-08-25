@@ -1,13 +1,13 @@
 # Rate Limiting Service
 
 An API-key-based rate limiting service built on Spring Boot 3 with MySQL, Redis and
-RocketMQ. Written as a backend take-home assignment; the assignment brief itself is
-deliberately not reproduced here.
+RocketMQ. Written as a backend take-home assignment.
 
 | Document | What is in it |
 | --- | --- |
 | [`HELP.md`](HELP.md) | How to start everything, verify it, and every configuration trap that costs an hour if missed |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | The design: architecture, data model, the algorithm, failure semantics, limitations and what production would need |
+| [`docs/ASSIGNMENT.md`](docs/ASSIGNMENT.md) | The original assignment brief, verbatim |
 | [`curl-samples.sh`](curl-samples.sh) | The full API walked end to end, runnable against a live instance |
 
 ## In one minute
