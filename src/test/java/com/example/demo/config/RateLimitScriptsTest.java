@@ -127,15 +127,31 @@ class RateLimitScriptsTest {
     }
 
     @Test
-    @DisplayName("a counter left without an expiry reports a TTL of zero, not -1")
-    void aMissingExpiryIsNormalised() {
-        // TTL answers -1 for a key with no expiry. Only reachable if something outside the
-        // script created the counter, but -1 would travel straight into windowTtlSeconds
-        // and Retry-After.
+    @DisplayName("a counter left without an expiry has one put back, whatever it is counting from")
+    void aMissingExpiryIsRepaired() {
+        // A counter that exists with no expiry, at a value the window never started from.
+        // Reachable whenever something writes the key directly -- a batched reservation
+        // handing unused quota back after the window rolled, or an operator's DECRBY.
+        redis.opsForValue().set(KEY, "-17");
+
+        assertThat(checkAndIncr(100, 60).ttl())
+                .as("keyed on 'usage == 1' this counter could never open a window again: its "
+                        + "expiry would stay lost, it would climb to the limit and refuse that "
+                        + "API key until someone deleted the key by hand")
+                .isEqualTo(60);
+        assertThat(redis.getExpire(KEY)).isPositive();
+    }
+
+    @Test
+    @DisplayName("peek reports a counter without an expiry as TTL zero, and does not repair it")
+    void peekNormalisesAMissingExpiry() {
+        // TTL answers -1 for a key with no expiry, and -1 would travel straight into
+        // windowTtlSeconds. Repairing is the incrementing script's job: /usage must not
+        // change the window it is reporting on.
         redis.opsForValue().set(KEY, "5");
 
-        assertThat(checkAndIncr(100, 60).ttl()).isZero();
         assertThat(peek().ttl()).isZero();
+        assertThat(redis.getExpire(KEY)).isEqualTo(-1);
     }
 
     @Test

@@ -387,13 +387,15 @@ if used >= limit then
 else
     allowed = 1
     used = redis.call('INCR', KEYS[1])
-    if used == 1 then
-        redis.call('EXPIRE', KEYS[1], window)        -- set TTL only on the first request
-    end
 end
 
 local ttl = redis.call('TTL', KEYS[1])
-if ttl < 0 then ttl = 0 end                          -- normalize -1 (no TTL) / -2 (missing) to 0
+if ttl == -1 then
+    redis.call('EXPIRE', KEYS[1], window)            -- no expiry: the window opens here
+    ttl = window
+elseif ttl == -2 then
+    ttl = 0                                          -- key absent; nothing to report
+end
 return { allowed, used, ttl }
 ```
 
@@ -412,6 +414,21 @@ essentially unchanged.
 
 Boundary behaviour: with `limit = 100`, the 100th request is allowed and the 101st is
 blocked.
+
+**The window opens on "this counter has no expiry", not on "usage == 1".** The two agree
+only for as long as counting always starts at 1 — which `INCR` on an absent key guarantees,
+right up until something writes the counter directly. A batched reservation handing unused
+quota back after the window has rolled (`DECRBY` on a key that has since expired) recreates
+it at a negative value with no expiry; so does an operator repairing something by hand.
+Keyed on the usage, such a counter can never satisfy `== 1` again: its expiry stays lost
+forever, the count climbs to the limit, and the API key is refused until someone deletes the
+key manually — the same permanent lockout that splitting `INCR` and `EXPIRE` across two round
+trips would cause, arriving through a different door, and just as silent. Keyed on the TTL,
+the next request repairs it. Refreshing an expiry that is still positive is what would turn
+the fixed window into an idle sliding one, and that is exactly what the `-1` test excludes.
+
+`peek.lua` deliberately does **not** repair: `/usage` reports the window, it does not change
+it.
 
 **TTL is always normalised to a non-negative value.** `TTL` returns `-1` for "key exists
 but has no expiry" and `-2` for "key does not exist". Passing those through would let
