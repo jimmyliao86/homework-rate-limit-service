@@ -387,13 +387,15 @@ if used >= limit then
 else
     allowed = 1
     used = redis.call('INCR', KEYS[1])
-    if used == 1 then
-        redis.call('EXPIRE', KEYS[1], window)        -- set TTL only on the first request
-    end
 end
 
 local ttl = redis.call('TTL', KEYS[1])
-if ttl < 0 then ttl = 0 end                          -- normalize -1 (no TTL) / -2 (missing) to 0
+if ttl == -1 then
+    redis.call('EXPIRE', KEYS[1], window)            -- no expiry: the window opens here
+    ttl = window
+elseif ttl == -2 then
+    ttl = 0                                          -- key absent; nothing to report
+end
 return { allowed, used, ttl }
 ```
 
@@ -412,6 +414,21 @@ essentially unchanged.
 
 Boundary behaviour: with `limit = 100`, the 100th request is allowed and the 101st is
 blocked.
+
+**The window opens on "this counter has no expiry", not on "usage == 1".** The two agree
+only for as long as counting always starts at 1 — which `INCR` on an absent key guarantees,
+right up until something writes the counter directly. A batched reservation handing unused
+quota back after the window has rolled (`DECRBY` on a key that has since expired) recreates
+it at a negative value with no expiry; so does an operator repairing something by hand.
+Keyed on the usage, such a counter can never satisfy `== 1` again: its expiry stays lost
+forever, the count climbs to the limit, and the API key is refused until someone deletes the
+key manually — the same permanent lockout that splitting `INCR` and `EXPIRE` across two round
+trips would cause, arriving through a different door, and just as silent. Keyed on the TTL,
+the next request repairs it. Refreshing an expiry that is still positive is what would turn
+the fixed window into an idle sliding one, and that is exactly what the `-1` test excludes.
+
+`peek.lua` deliberately does **not** repair: `/usage` reports the window, it does not change
+it.
 
 **TTL is always normalised to a non-negative value.** `TTL` returns `-1` for "key exists
 but has no expiry" and `-2` for "key does not exist". Passing those through would let
@@ -1637,6 +1654,7 @@ time budget of this assignment:
 | 14.8 | MQ volume equals `/check` volume | Publishing every outcome (§10.1) means one message per request, unsampled and unbatched. `DefaultMQProducer` bounds in-flight async sends with a semaphore (`clientAsyncSemaphoreValue`, default 65535); sustained overload starts rejecting sends, and since rejections are logged and dropped, the log becomes the next bottleneck. The same volume problem reaches the consumer's log in one specific case: `REQUEST_BLOCKED` is logged at `INFO` (§10.4) on the assumption that refusals are comparatively rare, which stops being true while a key is under sustained attack — precisely when every one of those lines is least useful. Bounding it would need the log itself to be rate limited (once per key per interval), which is deliberately not built here. Fine at assignment scale; mitigations are named in §15 |
 | 14.9 | The incarnation discriminator is millisecond-resolution | `created_at` is `DATETIME(3)`, so two incarnations of one API key created in the same millisecond share a counter namespace. Reaching it also needs the earlier incarnation to have left counters at two or more versions, since `DELETE` removes precisely the one it was on (§4.3) — unreachable across HTTP round trips, and recorded rather than engineered against. `DATETIME(6)` would close it at the cost of a schema change |
 | 14.10 | The write-back guard is bounded by its own TTL | The token of §6.6 expires after 600s. A reader stalled longer than that between capturing its token and writing back would find the key absent, match the empty sentinel and be accepted — against a 2s single-flight timeout, so the margin is roughly 300x. Removing the bound entirely would mean a key per API key that never expires |
+| 14.11 | The Lua scripts assume a single-slot Redis | The keys of §3.3 carry no hash tag, so `rate_limit:config:<apiKey>`, `rate_limit:epoch:<apiKey>` and `rate_limit:counter:<apiKey>:...` hash to three unrelated slots. `check_and_incr.lua` and `peek.lua` take one key each and are unaffected, but `cache_put.lua` (config + epoch) and `invalidate.lua` (config + epoch + counter) are multi-key and would fail with `CROSSSLOT` on a clustered Redis: the config cache would stop writing back and rule changes would stop invalidating. Correct on the single instance this deploys to (§12.2), and recorded here because it is a deployment-topology assumption rather than a bug — the fix is in §15 |
 
 ---
 
@@ -1645,7 +1663,19 @@ time budget of this assignment:
 If this service needed to run at significantly larger scale:
 
 - **Redis availability**: Sentinel or Cluster, replication, persistence configuration,
-  latency monitoring
+  latency monitoring. Moving to Cluster first requires closing §14.11: give every key of one
+  API key a shared hash tag so they land in the same slot, e.g.
+  `rate_limit:config:{<apiKey>}`, `rate_limit:epoch:{<apiKey>}`,
+  `rate_limit:counter:{<apiKey>}:c<createdAt>:v<version>`. The change is confined to
+  `RedisKeys` — the scripts address keys only through `KEYS[n]` and need no edit at all —
+  but it carries two consequences. It is a **breaking key-format change**: existing entries
+  are unreachable under the new format, so a deployment is effectively a cache flush (rules
+  reload from MySQL, live counters reset for their current window) and belongs in a low
+  traffic window. And it makes the **apiKey character set load-bearing**, which it is not
+  today: `CreateLimitRequest` validates only `@NotBlank` and `@Size(max = 128)`, so a key
+  containing a brace would have Redis take the innermost `{...}` as the tag (`a}b{c` tags on
+  `c`) and scatter the keys again — a `@Pattern` such as `^[A-Za-z0-9_.-]+$` has to land in
+  the same change
 - **Stampede and penetration**: a distributed lock (Redisson) for cross-instance
   single-flight, a bloom filter to pre-filter fresh random keys (closing the gap in
   §14.7), proactive cache warming

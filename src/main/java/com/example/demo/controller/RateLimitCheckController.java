@@ -14,6 +14,8 @@ import com.example.demo.service.RateLimitCheckService;
 
 import jakarta.validation.constraints.NotBlank;
 
+import java.time.Instant;
+
 /**
  * The two read-side endpoints: {@code GET /check}, which consumes quota, and
  * {@code GET /usage}, which does not.
@@ -67,7 +69,7 @@ public class RateLimitCheckController {
         HttpHeaders headers = new HttpHeaders();
         headers.add(LIMIT_HEADER, String.valueOf(response.limitCount()));
         headers.add(REMAINING_HEADER, String.valueOf(response.remaining()));
-        headers.add(RESET_HEADER, String.valueOf(response.windowTtlSeconds()));
+        headers.add(RESET_HEADER, String.valueOf(Instant.now().getEpochSecond() + response.windowTtlSeconds()));
         if (!response.allowed()) {
             // The TTL is already in hand, so the standard 429 companion header costs
             // nothing and spares the client from parsing the body to find out how long to
